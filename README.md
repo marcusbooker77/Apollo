@@ -10,6 +10,22 @@ Apollo is a desktop streaming host fork focused on low-latency Windows streaming
 - Primary Windows executable name: `sunshine.exe`
 - Virtual display support is Windows-first
 
+## What Changed In The March 10-11, 2026 Sprint
+
+- Published the first cleaned-up stable release for this fork as [`v1.0.0`](https://github.com/marcusbooker77/Apollo/releases/tag/v1.0.0) with Windows installer and portable packages
+- Stabilized the Windows build and packaging path, cleaned up release metadata, and aligned the repo docs with the shipped release
+- Added live performance endpoints at `GET /api/performance` and `GET /api/performance/prometheus`
+- Added [`scripts/profile_streaming.ps1`](scripts/profile_streaming.ps1) for real-session profiling with JSON and Prometheus output
+- Added real CPU, memory, GPU, frame, packet, and session metrics for workload analysis
+- Reduced hot-path overhead with packet reuse, less encode-path allocation churn, scratch-buffer reuse, and lower logging overhead
+- Improved Windows streaming smoothness with exact refresh pacing, observed cadence calibration, and softer Desktop Duplication recovery
+- Added adaptive stream controls for FEC, pacing, and live bitrate reconfiguration during a session
+- Added NVENC live bitrate reconfiguration so weak-network recovery does not always require a full stream restart
+- Added optional Tracy and OpenTelemetry hooks for deeper tracing and profiling
+- Added experimental MsQuic, WebTransport, and WebCodecs capability surfaces for future transport/client work
+
+For the full technical history, see [`OPTIMIZATION_SUMMARY.md`](OPTIMIZATION_SUMMARY.md).
+
 ## Key Features
 
 - Built-in virtual display with per-client resolution and refresh matching
