@@ -1,6 +1,6 @@
 {
   "name": "sunshine",
-  "version": "0.0.0",
+  "version": "1.0.0",
   "scripts": {
     "build": "vite build --debug",
     "build-clean": "vite build --debug --emptyOutDir",
