@@ -2,6 +2,7 @@
 
 **Project Start:** February 12, 2026
 **Latest Update:** March 11, 2026
+**Release Baseline:** Apollo `v1.0.0`
 **Status:** Built, instrumented for real workload profiling, extended with experimental tracing/browser transport labs, hardened against common stutter cases, and now supports live encoder bitrate reconfiguration
 **Total Performance Gain:** 30-50% improvement, plus runtime visibility for live stream analysis
 

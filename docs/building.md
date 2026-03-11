@@ -1,5 +1,5 @@
 # Building
-Sunshine binaries are built using [CMake](https://cmake.org) and requires `cmake` > 3.25.
+Apollo binaries are built using [CMake](https://cmake.org) and require `cmake` > 3.25.
 
 ## Building Locally
 
@@ -15,13 +15,12 @@ It is recommended to use one of the following compilers:
 ### Dependencies
 
 #### Linux
-Dependencies vary depending on the distribution. You can reference our
-[linux_build.sh](https://github.com/LizardByte/Sunshine/blob/master/scripts/linux_build.sh) script for a list of
-dependencies we use in Debian-based and Fedora-based distributions. Please submit a PR if you would like to extend the
-script to support other distributions.
+Dependencies vary depending on the distribution. You can reference the local
+[`scripts/linux_build.sh`](../scripts/linux_build.sh) script for a list of dependencies used in Debian-based and
+Fedora-based distributions. Please submit a PR if you would like to extend the script to support other distributions.
 
 ##### CUDA Toolkit
-Sunshine requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
+Apollo requires CUDA Toolkit for NVFBC capture. There are two caveats to CUDA:
 
 1. The version installed depends on the version of GCC.
 2. The version of CUDA you use will determine compatibility with various GPU generations.
@@ -117,7 +116,7 @@ pacman -S "${dependencies[@]}"
 Ensure [git](https://git-scm.com) is installed on your system, then clone the repository using the following command:
 
 ```bash
-git clone https://github.com/ClassicOldSong/Apollo.git --recurse-submodules
+git clone https://github.com/marcusbooker77/Apollo.git --recurse-submodules
 cd Apollo
 mkdir build
 ```
@@ -131,7 +130,7 @@ ninja -C build
 
 > [!TIP]
 > Available build options can be found in
-> [options.cmake](https://github.com/LizardByte/Sunshine/blob/master/cmake/prep/options.cmake).
+> [`cmake/prep/options.cmake`](../cmake/prep/options.cmake).
 
 ### Package
 
@@ -160,12 +159,9 @@ ninja -C build
 }
 
 ### Remote Build
-It may be beneficial to build remotely in some cases. This will enable easier building on different operating systems.
+This fork does not currently publish CI workflow artifacts from GitHub Actions.
 
-1. Fork the project
-2. Activate workflows
-3. Trigger the *CI* workflow manually
-4. Download the artifacts/binaries from the workflow run summary
+If you need a remote build, use your own runner or build in a clean clone on the target OS.
 
 <div class="section_buttons">
 

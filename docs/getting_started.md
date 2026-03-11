@@ -1,15 +1,20 @@
 # Getting Started
 
-The recommended method for running Sunshine is to use the [binaries](#binaries) included in the
+The recommended method for running Apollo is to use the Windows binaries included in the
 [latest release][latest-release], unless otherwise specified.
 
-[Pre-releases](https://github.com/LizardByte/Sunshine/releases) are also available. These should be considered beta,
+[Pre-releases](https://github.com/marcusbooker77/Apollo/releases) are also available. These should be considered beta,
 and release artifacts may be missing when merging changes on a faster cadence.
 
 ## Binaries
 
-Binaries of Sunshine are created for each release. They are available for Linux, macOS, and Windows.
-Binaries can be found in the [latest release][latest-release].
+Official Apollo `1.0.0` binaries are currently published for Windows through GitHub Releases.
+
+> [!IMPORTANT]
+> The official Apollo release channel currently publishes Windows assets:
+> `Apollo-Windows-AMD64-installer.exe` and `Apollo-Windows-AMD64-portable.zip`.
+> Some Linux, macOS, Docker, and package-manager notes below are inherited reference material from upstream Sunshine
+> and may require source builds or upstream packaging rather than Apollo-hosted binaries.
 
 > [!NOTE]
 > Some third party packages also exist.
@@ -297,13 +302,13 @@ brew uninstall sunshine
 #### Installer (recommended)
 
 1. Download and install
-   [Sunshine-Windows-AMD64-installer.exe](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.exe)
+   [Apollo-Windows-AMD64-installer.exe](https://github.com/marcusbooker77/Apollo/releases/latest/download/Apollo-Windows-AMD64-installer.exe)
 
 > [!CAUTION]
 > You should carefully select or unselect the options you want to install. Do not blindly install or
 > enable features.
 
-To uninstall, find Sunshine in the list <a href="ms-settings:installed-apps">here</a> and select "Uninstall" from the
+To uninstall, find Apollo in the list <a href="ms-settings:installed-apps">here</a> and select "Uninstall" from the
 overflow menu. Different versions of Windows may provide slightly different steps for uninstall.
 
 #### Standalone (lite version)
@@ -313,7 +318,7 @@ overflow menu. Different versions of Windows may provide slightly different step
 > recommended for most users. No support will be provided!
 
 1. Download and extract
-   [Sunshine-Windows-AMD64-portable.zip](https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-portable.zip)
+   [Apollo-Windows-AMD64-portable.zip](https://github.com/marcusbooker77/Apollo/releases/latest/download/Apollo-Windows-AMD64-portable.zip)
 2. Open command prompt as administrator
 3. Firewall rules
 
@@ -581,4 +586,4 @@ Tutorials and Guides are community generated. Want to contribute? Reach out to u
   [TOC]
 </details>
 
-[latest-release]: https://github.com/LizardByte/Sunshine/releases/latest
+[latest-release]: https://github.com/marcusbooker77/Apollo/releases/latest
