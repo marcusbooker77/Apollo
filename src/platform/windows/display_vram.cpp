@@ -1560,6 +1560,11 @@ namespace platf::dxgi {
     return dup.release_frame();
   }
 
+  bool display_ddup_vram_t::try_recover_after_reinit() {
+    dup.reset();
+    return dup.init(this, init_config) == 0;
+  }
+
   int display_ddup_vram_t::init(const ::video::config_t &config, const std::string &display_name) {
     if (display_base_t::init(config, display_name) || dup.init(this, config)) {
       return -1;

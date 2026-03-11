@@ -319,6 +319,11 @@ namespace platf::dxgi {
     return dup.release_frame();
   }
 
+  bool display_ddup_ram_t::try_recover_after_reinit() {
+    dup.reset();
+    return dup.init(this, init_config) == 0;
+  }
+
   std::shared_ptr<platf::img_t> display_ram_t::alloc_img() {
     auto img = std::make_shared<img_t>();
 

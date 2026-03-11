@@ -71,6 +71,13 @@ namespace nvenc {
     bool encode_frame(uint64_t frame_index, bool force_idr, video::packet_raw_generic &encoded_packet, bool &after_ref_frame_invalidation);
 
     /**
+     * @brief Update encoder bitrate without recreating the session.
+     * @param bitrate_kbps Target bitrate in kilobits per second.
+     * @return `true` on success, `false` on error.
+     */
+    bool reconfigure_bitrate(uint32_t bitrate_kbps);
+
+    /**
      * @brief Perform reference frame invalidation (RFI) procedure.
      * @param first_frame First frame index of the invalidation range.
      * @param last_frame Last frame index of the invalidation range.
@@ -153,6 +160,15 @@ namespace nvenc {
   private:
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
     uint32_t minimum_api_version = 0;
+
+    struct {
+      NV_ENC_INITIALIZE_PARAMS init_params {};
+      NV_ENC_CONFIG config {};
+      uint32_t bitrate_kbps = 0;
+      uint32_t framerate = 0;
+      bool custom_vbv_supported = false;
+      bool ready = false;
+    } reconfigure_state;
 
     struct {
       uint64_t last_encoded_frame_index = 0;

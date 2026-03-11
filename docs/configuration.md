@@ -1880,6 +1880,79 @@ editing the `conf` file in a text editor. Use the examples as reference.
     </tr>
 </table>
 
+### adaptive_fec
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow Apollo to temporarily raise or lower video FEC in response to recent client-reported packet loss.
+            This helps smooth transient Wi-Fi or buffer-overrun periods without forcing a fixed high-overhead FEC level all the time.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_fec = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### adaptive_pacing
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow Apollo to soften or recover packet pacing based on recent packet-loss reports and local send-pressure.
+            This reduces burstiness on fragile links at the cost of a small amount of extra sender-side spacing when the network is struggling.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_pacing = enabled
+            @endcode</td>
+    </tr>
+</table>
+
+### adaptive_bitrate
+
+<table>
+    <tr>
+        <td>Description</td>
+        <td colspan="2">
+            Allow Apollo to lower or recover the active encoder bitrate during a session based on packet-loss feedback
+            and local send pressure. This keeps the stream moving on unstable links by trading temporary quality for
+            fewer stalls and fewer large burst losses.
+        </td>
+    </tr>
+    <tr>
+        <td>Default</td>
+        <td colspan="2">@code{}
+            enabled
+            @endcode</td>
+    </tr>
+    <tr>
+        <td>Example</td>
+        <td colspan="2">@code{}
+            adaptive_bitrate = enabled
+            @endcode</td>
+    </tr>
+</table>
+
 ### qp
 
 <table>

@@ -51,6 +51,8 @@ namespace stream {
     bool uuid_match(const session_t& session, const std::string_view& uuid);
     bool update_device_info(session_t& session, const std::string& name, const crypto::PERM& newPerm);
     int start(session_t &session, const std::string &addr_string);
+    int target_bitrate_kbps(const session_t &session);
+    void applied_bitrate_kbps(session_t &session, int bitrate_kbps);
     void stop(session_t &session);
     void graceful_stop(session_t& session);
     void join(session_t &session);

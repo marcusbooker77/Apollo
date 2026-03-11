@@ -451,8 +451,197 @@ namespace stream {
     safe::mail_raw_t::event_t<bool> shutdown_event;
     safe::signal_t controlEnd;
 
+    struct {
+      std::atomic<uint64_t> video_packets_since_feedback {0};
+      std::atomic<uint32_t> fec_percentage {0};
+      std::atomic<uint32_t> pacing_percent {80};
+      std::atomic<uint32_t> target_bitrate_kbps {0};
+      std::atomic<uint32_t> applied_bitrate_kbps {0};
+      std::atomic<uint64_t> clean_feedback_reports {0};
+      std::atomic<double> loss_ratio_ema {0.0};
+      std::atomic<double> send_overshoot_ms_ema {0.0};
+    } adaptive;
+
     std::atomic<session::state_e> state;
   };
+
+  namespace {
+    constexpr uint32_t base_pacing_percent = 80;
+    constexpr uint32_t min_pacing_percent = 45;
+    constexpr uint32_t max_pacing_percent = 80;
+    constexpr uint32_t max_adaptive_fec_percentage = 60;
+    constexpr uint32_t min_adaptive_bitrate_floor_kbps = 1000;
+    constexpr uint32_t min_adaptive_bitrate_ratio_percent = 55;
+    constexpr uint32_t min_bitrate_adjustment_step_kbps = 250;
+
+    double update_ema(std::atomic<double> &target, double sample, double alpha) {
+      const auto previous = target.load(std::memory_order_relaxed);
+      const auto next = previous == 0.0 ? sample : previous * (1.0 - alpha) + sample * alpha;
+      target.store(next, std::memory_order_relaxed);
+      return next;
+    }
+
+    uint32_t move_towards(uint32_t current, uint32_t target, uint32_t step) {
+      if (current < target) {
+        return std::min(target, current + step);
+      }
+      if (current > target) {
+        return std::max(target, current - step);
+      }
+      return current;
+    }
+
+    uint32_t minimum_adaptive_bitrate_kbps(const session_t *session) {
+      const auto base_bitrate = static_cast<uint32_t>(std::max(session->config.monitor.bitrate, 1));
+      const auto percentage_floor = base_bitrate * min_adaptive_bitrate_ratio_percent / 100;
+      return std::clamp<uint32_t>(
+        std::max<uint32_t>(percentage_floor, min_adaptive_bitrate_floor_kbps),
+        1,
+        base_bitrate
+      );
+    }
+
+    uint32_t clamp_adaptive_bitrate_kbps(const session_t *session, uint32_t bitrate_kbps) {
+      const auto base_bitrate = static_cast<uint32_t>(std::max(session->config.monitor.bitrate, 1));
+      return std::clamp(bitrate_kbps, minimum_adaptive_bitrate_kbps(session), base_bitrate);
+    }
+
+    void maybe_log_adaptive_state(session_t *session, const char *reason, uint32_t old_fec, uint32_t old_pacing, uint32_t old_bitrate) {
+      const auto new_fec = session->adaptive.fec_percentage.load(std::memory_order_relaxed);
+      const auto new_pacing = session->adaptive.pacing_percent.load(std::memory_order_relaxed);
+      const auto new_bitrate = session->adaptive.target_bitrate_kbps.load(std::memory_order_relaxed);
+      if (new_fec == old_fec && new_pacing == old_pacing && new_bitrate == old_bitrate) {
+        return;
+      }
+
+      BOOST_LOG(info)
+        << "Adaptive stream control updated ["sv << reason << "] fec ["sv << old_fec << " -> "sv << new_fec
+        << "] pacing ["sv << old_pacing << "% -> "sv << new_pacing
+        << "%] bitrate ["sv << old_bitrate << " -> "sv << new_bitrate << " kbps]"sv;
+    }
+
+    void update_adaptive_control_from_feedback(session_t *session, uint64_t loss_count) {
+      if (!config::stream.adaptive_fec && !config::stream.adaptive_pacing && !config::stream.adaptive_bitrate) {
+        session->adaptive.video_packets_since_feedback.store(0, std::memory_order_relaxed);
+        return;
+      }
+
+      const auto sent_packets = session->adaptive.video_packets_since_feedback.exchange(0, std::memory_order_relaxed);
+      const auto loss_ratio_sample = sent_packets > 0 ?
+        static_cast<double>(loss_count) / static_cast<double>(std::max<uint64_t>(sent_packets, loss_count)) :
+        (loss_count > 0 ? 1.0 : 0.0);
+      const auto loss_ratio_ema = update_ema(session->adaptive.loss_ratio_ema, loss_ratio_sample, 0.30);
+
+      auto clean_reports = session->adaptive.clean_feedback_reports.load(std::memory_order_relaxed);
+      if (loss_count == 0) {
+        clean_reports += 1;
+      } else {
+        clean_reports = 0;
+      }
+      session->adaptive.clean_feedback_reports.store(clean_reports, std::memory_order_relaxed);
+
+      const auto old_fec = session->adaptive.fec_percentage.load(std::memory_order_relaxed);
+      const auto old_pacing = session->adaptive.pacing_percent.load(std::memory_order_relaxed);
+      const auto old_bitrate = session->adaptive.target_bitrate_kbps.load(std::memory_order_relaxed);
+      auto new_fec = old_fec;
+      auto new_pacing = old_pacing;
+      auto new_bitrate = old_bitrate;
+
+      const auto base_fec = static_cast<uint32_t>(std::clamp(config::stream.fec_percentage, 1, static_cast<int>(max_adaptive_fec_percentage)));
+      if (config::stream.adaptive_fec) {
+        uint32_t target_fec = base_fec;
+        if (loss_ratio_ema >= 0.050) {
+          target_fec = std::min<uint32_t>(max_adaptive_fec_percentage, base_fec + 20);
+        } else if (loss_ratio_ema >= 0.020) {
+          target_fec = std::min<uint32_t>(max_adaptive_fec_percentage, base_fec + 12);
+        } else if (loss_ratio_ema >= 0.005) {
+          target_fec = std::min<uint32_t>(max_adaptive_fec_percentage, base_fec + 6);
+        } else if (clean_reports < 4) {
+          target_fec = std::max(base_fec, old_fec);
+        }
+
+        const auto step = target_fec > old_fec ? 2u : 1u;
+        new_fec = move_towards(old_fec, target_fec, step);
+        session->adaptive.fec_percentage.store(new_fec, std::memory_order_relaxed);
+      }
+
+      if (config::stream.adaptive_pacing) {
+        uint32_t target_pacing = base_pacing_percent;
+        if (loss_ratio_ema >= 0.050) {
+          target_pacing = 55;
+        } else if (loss_ratio_ema >= 0.020) {
+          target_pacing = 65;
+        } else if (loss_ratio_ema >= 0.005) {
+          target_pacing = 72;
+        } else if (clean_reports < 4) {
+          target_pacing = std::min<uint32_t>(old_pacing, base_pacing_percent);
+        }
+
+        const auto step = target_pacing > old_pacing ? 1u : 3u;
+        new_pacing = move_towards(old_pacing, std::clamp(target_pacing, min_pacing_percent, max_pacing_percent), step);
+        session->adaptive.pacing_percent.store(new_pacing, std::memory_order_relaxed);
+      }
+
+      if (config::stream.adaptive_bitrate) {
+        const auto base_bitrate = static_cast<uint32_t>(std::max(session->config.monitor.bitrate, 1));
+        auto target_bitrate = base_bitrate;
+        if (loss_ratio_ema >= 0.050) {
+          target_bitrate = base_bitrate * 65 / 100;
+        } else if (loss_ratio_ema >= 0.020) {
+          target_bitrate = base_bitrate * 78 / 100;
+        } else if (loss_ratio_ema >= 0.005) {
+          target_bitrate = base_bitrate * 90 / 100;
+        } else if (clean_reports < 4) {
+          target_bitrate = std::min(old_bitrate, base_bitrate);
+        }
+
+        const auto step = target_bitrate > old_bitrate ?
+          std::max<uint32_t>(min_bitrate_adjustment_step_kbps, base_bitrate / 20) :
+          std::max<uint32_t>(min_bitrate_adjustment_step_kbps, base_bitrate / 10);
+        new_bitrate = move_towards(old_bitrate, clamp_adaptive_bitrate_kbps(session, target_bitrate), step);
+        session->adaptive.target_bitrate_kbps.store(new_bitrate, std::memory_order_relaxed);
+      }
+
+      maybe_log_adaptive_state(session, "feedback", old_fec, old_pacing, old_bitrate);
+    }
+
+    void update_adaptive_control_from_send_pressure(session_t *session, double overshoot_ms, bool send_failed) {
+      if (!config::stream.adaptive_fec && !config::stream.adaptive_pacing && !config::stream.adaptive_bitrate) {
+        return;
+      }
+
+      if (overshoot_ms <= 0.5 && !send_failed) {
+        return;
+      }
+
+      const auto overshoot_ema = update_ema(session->adaptive.send_overshoot_ms_ema, std::max(overshoot_ms, send_failed ? 5.0 : overshoot_ms), 0.20);
+      const auto old_fec = session->adaptive.fec_percentage.load(std::memory_order_relaxed);
+      const auto old_pacing = session->adaptive.pacing_percent.load(std::memory_order_relaxed);
+      const auto old_bitrate = session->adaptive.target_bitrate_kbps.load(std::memory_order_relaxed);
+
+      if (config::stream.adaptive_pacing && (overshoot_ema >= 2.0 || send_failed)) {
+        const auto reduced = old_pacing > min_pacing_percent ? old_pacing - 1 : old_pacing;
+        session->adaptive.pacing_percent.store(std::max<uint32_t>(min_pacing_percent, reduced), std::memory_order_relaxed);
+      }
+
+      if (config::stream.adaptive_fec && (overshoot_ema >= 3.0 || send_failed)) {
+        const auto increased = std::min<uint32_t>(max_adaptive_fec_percentage, old_fec + 1);
+        session->adaptive.fec_percentage.store(increased, std::memory_order_relaxed);
+      }
+
+      if (config::stream.adaptive_bitrate && (overshoot_ema >= 1.5 || send_failed)) {
+        const auto base_bitrate = static_cast<uint32_t>(std::max(session->config.monitor.bitrate, 1));
+        const auto reduction = send_failed ?
+          std::max<uint32_t>(min_bitrate_adjustment_step_kbps * 2, base_bitrate / 8) :
+          std::max<uint32_t>(min_bitrate_adjustment_step_kbps, base_bitrate / 20);
+        const auto reduced = old_bitrate > reduction ? old_bitrate - reduction : 1;
+        session->adaptive.target_bitrate_kbps.store(clamp_adaptive_bitrate_kbps(session, reduced), std::memory_order_relaxed);
+      }
+
+      session->adaptive.clean_feedback_reports.store(0, std::memory_order_relaxed);
+      maybe_log_adaptive_state(session, send_failed ? "send failure" : "send pressure", old_fec, old_pacing, old_bitrate);
+    }
+  }  // namespace
 
   /**
    * First part of cipher must be struct of type control_encrypted_t
@@ -1012,6 +1201,8 @@ namespace stream {
         perf::performance_monitor_t::instance().record_packet_lost(static_cast<uint64_t>(count));
       }
 
+      update_adaptive_control_from_feedback(session, count > 0 ? static_cast<uint64_t>(count) : 0);
+
       BOOST_LOG(verbose)
         << "type [IDX_LOSS_STATS]"sv << std::endl
         << "---begin stats---" << std::endl
@@ -1495,7 +1686,9 @@ namespace stream {
         frame_header.frame_processing_latency = 0;
       }
 
-      auto fecPercentage = config::stream.fec_percentage;
+      auto fecPercentage = config::stream.adaptive_fec ?
+        static_cast<int>(session->adaptive.fec_percentage.load(std::memory_order_relaxed)) :
+        config::stream.fec_percentage;
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -1556,8 +1749,14 @@ namespace stream {
       }
 
       try {
-        // Use around 80% of 1Gbps          1Gbps            percent    ms     packet      byte
-        size_t ratecontrol_packets_in_1ms = std::giga::num * 80 / 100 / 1000 / blocksize / 8;
+        const auto pacing_percent = config::stream.adaptive_pacing ?
+          session->adaptive.pacing_percent.load(std::memory_order_relaxed) :
+          base_pacing_percent;
+
+        // Use a conservative portion of 1Gbps and adjust it per session when the client reports loss
+        // or when the sender starts falling behind schedule.
+        size_t ratecontrol_packets_in_1ms = std::giga::num * pacing_percent / 100 / 1000 / blocksize / 8;
+        ratecontrol_packets_in_1ms = std::max<size_t>(1, ratecontrol_packets_in_1ms);
 
         // Send less than 64K in a single batch.
         // On Windows, batches above 64K seem to bypass SO_SNDBUF regardless of its size,
@@ -1675,9 +1874,13 @@ namespace stream {
                   ratecontrol_frame_packets_sent == 0) {
                 auto due = ratecontrol_frame_start +
                            std::chrono::duration_cast<std::chrono::nanoseconds>(1ms) *
-                             ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
+                              ratecontrol_frame_packets_sent / ratecontrol_packets_in_1ms;
 
                 auto now = std::chrono::steady_clock::now();
+                const auto overshoot_ms = now > due ?
+                  std::chrono::duration<double, std::milli>(now - due).count() :
+                  0.0;
+                update_adaptive_control_from_send_pressure(session, overshoot_ms, false);
                 if (now < due) {
                   timer->sleep_for(due - now);
                 }
@@ -1688,12 +1891,14 @@ namespace stream {
               size_t current_batch_size = x - next_shard_to_send + 1;
               batch_info.block_offset = next_shard_to_send;
               batch_info.block_count = current_batch_size;
+              perf::performance_monitor_t::instance().record_send_queue_depth(current_batch_size);
 
               frame_send_batch_latency_logger.first_point_now();
               // Use a batched send if it's supported on this platform
               if (!platf::send_batch(batch_info)) {
                 // Batched send is not available, so send each packet individually
                 BOOST_LOG(verbose) << "Falling back to unbatched send"sv;
+                bool send_failed = false;
                 for (auto y = 0; y < current_batch_size; y++) {
                   auto send_info = platf::send_info_t {
                     shards.prefix(next_shard_to_send + y),
@@ -1706,14 +1911,18 @@ namespace stream {
                     session->localAddress,
                   };
 
-                  platf::send(send_info);
+                  if (!platf::send(send_info)) {
+                    send_failed = true;
+                  }
                 }
+                update_adaptive_control_from_send_pressure(session, 0.0, send_failed);
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
               perf::performance_monitor_t::instance().record_packet_batch_sent(
                 current_batch_size,
                 current_batch_size * (shards.prefixsize + shards.blocksize)
               );
+              session->adaptive.video_packets_since_feedback.fetch_add(current_batch_size, std::memory_order_relaxed);
 
               ratecontrol_group_packets_sent += current_batch_size;
               ratecontrol_frame_packets_sent += current_batch_size;
@@ -2086,6 +2295,14 @@ namespace stream {
       return false;
     }
 
+    int target_bitrate_kbps(const session_t &session) {
+      return static_cast<int>(session.adaptive.target_bitrate_kbps.load(std::memory_order_relaxed));
+    }
+
+    void applied_bitrate_kbps(session_t &session, int bitrate_kbps) {
+      session.adaptive.applied_bitrate_kbps.store(static_cast<uint32_t>(std::max(bitrate_kbps, 1)), std::memory_order_relaxed);
+    }
+
     void stop(session_t &session) {
       while_starting_do_nothing(session.state);
       auto expected = state_e::RUNNING;
@@ -2278,6 +2495,13 @@ namespace stream {
       session->undo_cmds = std::move(launch_session.client_undo_cmds);
 
       session->config = config;
+      session->adaptive.fec_percentage.store(
+        static_cast<uint32_t>(std::clamp(::config::stream.fec_percentage, 1, static_cast<int>(max_adaptive_fec_percentage))),
+        std::memory_order_relaxed
+      );
+      session->adaptive.pacing_percent.store(base_pacing_percent, std::memory_order_relaxed);
+      session->adaptive.target_bitrate_kbps.store(static_cast<uint32_t>(std::max(config.monitor.bitrate, 1)), std::memory_order_relaxed);
+      session->adaptive.applied_bitrate_kbps.store(static_cast<uint32_t>(std::max(config.monitor.bitrate, 1)), std::memory_order_relaxed);
 
       session->control.connect_data = launch_session.control_connect_data;
       session->control.feedback_queue = mail->queue<platf::gamepad_feedback_msg_t>(mail::gamepad_feedback);

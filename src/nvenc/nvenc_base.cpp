@@ -411,6 +411,14 @@ namespace nvenc {
       BOOST_LOG(debug) << "NvEnc: requested encoded frame size " << f % (client_config.bitrate / 8. / client_config.framerate) << " kB";
     }
 
+    reconfigure_state.config = enc_config;
+    reconfigure_state.init_params = init_params;
+    reconfigure_state.init_params.encodeConfig = &reconfigure_state.config;
+    reconfigure_state.bitrate_kbps = client_config.bitrate;
+    reconfigure_state.framerate = client_config.framerate;
+    reconfigure_state.custom_vbv_supported = get_encoder_cap(NV_ENC_CAPS_SUPPORT_CUSTOM_VBV_BUF_SIZE);
+    reconfigure_state.ready = true;
+
     {
       auto video_format_string = client_config.videoFormat == 0 ? "H.264 " :
                                  client_config.videoFormat == 1 ? "HEVC " :
@@ -484,6 +492,7 @@ namespace nvenc {
     }
 
     encoder_state = {};
+    reconfigure_state = {};
     encoder_params = {};
   }
 
@@ -585,6 +594,43 @@ namespace nvenc {
       encoded_packet.is_idr(),
       after_ref_frame_invalidation,
     };
+  }
+
+  bool nvenc_base::reconfigure_bitrate(uint32_t bitrate_kbps) {
+    if (!encoder || !reconfigure_state.ready || bitrate_kbps == 0) {
+      return false;
+    }
+
+    if (bitrate_kbps == reconfigure_state.bitrate_kbps) {
+      return true;
+    }
+
+    const auto bitrate_bps = bitrate_kbps * 1000U;
+    reconfigure_state.config.rcParams.averageBitRate = bitrate_bps;
+    reconfigure_state.config.rcParams.maxBitRate = bitrate_bps;
+
+    if (reconfigure_state.custom_vbv_supported && reconfigure_state.framerate > 0) {
+      reconfigure_state.config.rcParams.vbvBufferSize = bitrate_bps / reconfigure_state.framerate;
+      if (config::video.nv.vbv_percentage_increase > 0) {
+        reconfigure_state.config.rcParams.vbvBufferSize +=
+          reconfigure_state.config.rcParams.vbvBufferSize * config::video.nv.vbv_percentage_increase / 100;
+      }
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
+    reconfigure_params.reInitEncodeParams = reconfigure_state.init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &reconfigure_state.config;
+    reconfigure_params.resetEncoder = 1;
+    reconfigure_params.forceIDR = 1;
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
+      BOOST_LOG(error) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;
+      return false;
+    }
+
+    reconfigure_state.bitrate_kbps = bitrate_kbps;
+    BOOST_LOG(info) << "NvEnc: reconfigured bitrate to " << bitrate_kbps << " kbps";
+    return true;
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {

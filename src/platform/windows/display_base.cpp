@@ -4,6 +4,7 @@
  */
 // standard includes
 #include <cmath>
+#include <numeric>
 #include <thread>
 
 // platform includes
@@ -40,6 +41,40 @@ namespace platf {
 }
 
 namespace platf::dxgi {
+  namespace {
+    constexpr auto soft_reinit_window = 750ms;
+    constexpr int max_soft_reinit_attempts = 3;
+    constexpr int capture_rate_calibration_samples = 8;
+
+    DXGI_RATIONAL normalize_rational(DXGI_RATIONAL value) {
+      if (value.Numerator == 0 || value.Denominator == 0) {
+        return {0, 1};
+      }
+
+      const auto divisor = std::gcd(value.Numerator, value.Denominator);
+      return {value.Numerator / divisor, value.Denominator / divisor};
+    }
+
+    double rational_to_double(DXGI_RATIONAL value) {
+      if (value.Numerator == 0 || value.Denominator == 0) {
+        return 0.0;
+      }
+
+      return static_cast<double>(value.Numerator) / static_cast<double>(value.Denominator);
+    }
+
+    DXGI_RATIONAL approximate_frame_rate(double frames_per_second) {
+      if (frames_per_second <= 0.0) {
+        return {0, 1};
+      }
+
+      return normalize_rational({
+        static_cast<UINT>(std::llround(frames_per_second * 1000.0)),
+        1000,
+      });
+    }
+  }  // namespace
+
 
   /**
    * DDAPI-specific initialization goes here.
@@ -119,7 +154,7 @@ namespace platf::dxgi {
     display->display_refresh_rate = dup_desc.ModeDesc.RefreshRate;
     double display_refresh_rate_decimal = (double) display->display_refresh_rate.Numerator / display->display_refresh_rate.Denominator;
     BOOST_LOG(info) << "Display refresh rate [" << display_refresh_rate_decimal << "Hz]";
-    BOOST_LOG(info) << "Requested frame rate [" << display->client_frame_rate << "fps]";
+    BOOST_LOG(info) << "Requested frame rate [" << rational_to_double(display->requested_frame_rate) << "fps]";
     display->display_refresh_rate_rounded = lround(display_refresh_rate_decimal);
     return 0;
   }
@@ -192,30 +227,89 @@ namespace platf::dxgi {
     release_frame();
   }
 
+  bool display_base_t::try_recover_after_reinit() {
+    return false;
+  }
+
   capture_e display_base_t::capture(const push_captured_image_cb_t &push_captured_image_cb, const pull_free_image_cb_t &pull_free_image_cb, bool *cursor) {
-    auto adjust_client_frame_rate = [&]() -> DXGI_RATIONAL {
-      // Adjust capture frame interval when display refresh rate is not integral but very close to requested fps.
-      if (display_refresh_rate.Denominator > 1) {
-        DXGI_RATIONAL candidate = display_refresh_rate;
-        if (client_frame_rate % display_refresh_rate_rounded == 0) {
-          candidate.Numerator *= client_frame_rate / display_refresh_rate_rounded;
-        } else if (display_refresh_rate_rounded % client_frame_rate == 0) {
-          candidate.Denominator *= display_refresh_rate_rounded / client_frame_rate;
+    auto calibrate_requested_frame_rate = [&](DXGI_RATIONAL requested_rate) -> DXGI_RATIONAL {
+      requested_rate = normalize_rational(requested_rate);
+      const auto requested_rate_double = rational_to_double(requested_rate);
+      const auto display_rate_double = rational_to_double(display_refresh_rate);
+
+      if (requested_rate_double <= 0.0 || display_rate_double <= 0.0) {
+        return requested_rate;
+      }
+
+      auto best_rate = requested_rate;
+      auto best_delta = std::abs(requested_rate_double - display_rate_double);
+
+      auto consider_candidate = [&](DXGI_RATIONAL candidate) {
+        candidate = normalize_rational(candidate);
+        const auto candidate_rate = rational_to_double(candidate);
+        if (candidate_rate <= 0.0 || candidate_rate - requested_rate_double > 0.001) {
+          return;
         }
-        double candidate_rate = (double) candidate.Numerator / candidate.Denominator;
-        // Can only decrease requested fps, otherwise client may start accumulating frames and suffer increased latency.
-        if (client_frame_rate > candidate_rate && candidate_rate / client_frame_rate > 0.99) {
-          BOOST_LOG(info) << "Adjusted capture rate to " << candidate_rate << "fps to better match display";
-          return candidate;
+
+        const auto delta = std::abs(candidate_rate - requested_rate_double);
+        if (delta < best_delta && candidate_rate / requested_rate_double > 0.98) {
+          best_rate = candidate;
+          best_delta = delta;
+        }
+      };
+
+      consider_candidate(display_refresh_rate);
+
+      if (display_refresh_rate_rounded > 0 && client_frame_rate > 0) {
+        if (client_frame_rate % display_refresh_rate_rounded == 0) {
+          auto candidate = display_refresh_rate;
+          candidate.Numerator *= client_frame_rate / display_refresh_rate_rounded;
+          consider_candidate(candidate);
+        } else if (display_refresh_rate_rounded % client_frame_rate == 0) {
+          auto candidate = display_refresh_rate;
+          candidate.Denominator *= display_refresh_rate_rounded / client_frame_rate;
+          consider_candidate(candidate);
         }
       }
 
-      return {(uint32_t) client_frame_rate, 1};
+      if (best_rate.Numerator != requested_rate.Numerator || best_rate.Denominator != requested_rate.Denominator) {
+        BOOST_LOG(info) << "Adjusted capture rate to " << rational_to_double(best_rate) << "fps to better match display";
+      }
+
+      return best_rate;
     };
 
-    DXGI_RATIONAL client_frame_rate_adjusted = adjust_client_frame_rate();
+    DXGI_RATIONAL client_frame_rate_adjusted = calibrate_requested_frame_rate(requested_frame_rate);
     std::optional<std::chrono::steady_clock::time_point> frame_pacing_group_start;
+    std::optional<std::chrono::steady_clock::time_point> previous_captured_frame_timestamp;
+    std::optional<std::chrono::steady_clock::time_point> soft_reinit_window_deadline;
+    auto last_successful_capture = std::chrono::steady_clock::now();
     uint32_t frame_pacing_group_frames = 0;
+    int soft_reinit_attempts = 0;
+    int capture_rate_calibration_count = 0;
+    double observed_frame_interval_ns_ema = 0.0;
+
+    auto try_soft_recover = [&](const char *reason) {
+      const auto now = std::chrono::steady_clock::now();
+      if (!soft_reinit_window_deadline || now > *soft_reinit_window_deadline) {
+        soft_reinit_window_deadline = now + soft_reinit_window;
+        soft_reinit_attempts = 0;
+      }
+
+      if (soft_reinit_attempts >= max_soft_reinit_attempts || now - last_successful_capture > 2s) {
+        return false;
+      }
+
+      release_snapshot();
+      if (!try_recover_after_reinit()) {
+        return false;
+      }
+
+      ++soft_reinit_attempts;
+      BOOST_LOG(warning) << "Recovered from transient display interruption without full stream restart ["sv << reason << ']';
+      std::this_thread::sleep_for(40ms);
+      return true;
+    };
 
     // Keep the display awake during capture. If the display goes to sleep during
     // capture, best case is that capture stops until it powers back on. However,
@@ -233,6 +327,9 @@ namespace platf::dxgi {
       // display or GPU changes. We should reinit to examine the updated state of
       // the display subsystem. It is recommended to call this once per frame.
       if (!factory->IsCurrent()) {
+        if (try_soft_recover("factory invalidated")) {
+          continue;
+        }
         return platf::capture_e::reinit;
       }
 
@@ -310,6 +407,9 @@ namespace platf::dxgi {
 
       switch (status) {
         case platf::capture_e::reinit:
+          if (try_soft_recover("capture backend requested reinit")) {
+            continue;
+          }
         case platf::capture_e::error:
         case platf::capture_e::interrupted:
           return status;
@@ -319,6 +419,40 @@ namespace platf::dxgi {
           }
           break;
         case platf::capture_e::ok:
+          if (img_out && img_out->frame_timestamp) {
+            last_successful_capture = std::chrono::steady_clock::now();
+            soft_reinit_attempts = 0;
+
+            if (previous_captured_frame_timestamp && *img_out->frame_timestamp > *previous_captured_frame_timestamp) {
+              const auto interval = *img_out->frame_timestamp - *previous_captured_frame_timestamp;
+              if (interval > 0ns && interval < 250ms) {
+                const auto interval_ns = static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(interval).count());
+                observed_frame_interval_ns_ema = observed_frame_interval_ns_ema == 0.0 ?
+                  interval_ns :
+                  observed_frame_interval_ns_ema * 0.8 + interval_ns * 0.2;
+                capture_rate_calibration_count += 1;
+
+                if (capture_rate_calibration_count >= capture_rate_calibration_samples) {
+                  const auto observed_rate = 1e9 / observed_frame_interval_ns_ema;
+                  const auto observed_rational = approximate_frame_rate(observed_rate);
+                  const auto observed_rate_double = rational_to_double(observed_rational);
+                  const auto current_rate_double = rational_to_double(client_frame_rate_adjusted);
+                  const auto requested_rate_double = rational_to_double(requested_frame_rate);
+
+                  if (observed_rate_double > 0.0 &&
+                      observed_rate_double <= requested_rate_double &&
+                      observed_rate_double / requested_rate_double > 0.98 &&
+                      std::abs(observed_rate_double - current_rate_double) > 0.05) {
+                    client_frame_rate_adjusted = observed_rational;
+                    BOOST_LOG(info) << "Auto-calibrated capture pacing to " << observed_rate_double << "fps based on observed cadence";
+                  }
+                }
+              }
+            }
+
+            previous_captured_frame_timestamp = img_out->frame_timestamp;
+          }
+
           if (!push_captured_image_cb(std::move(img_out), true)) {
             return capture_e::ok;
           }
@@ -330,6 +464,9 @@ namespace platf::dxgi {
 
       status = release_snapshot();
       if (status != platf::capture_e::ok) {
+        if (status == platf::capture_e::reinit && try_soft_recover("release frame failed")) {
+          continue;
+        }
         return status;
       }
     }
@@ -712,7 +849,19 @@ namespace platf::dxgi {
       }
     }
 
+    init_config = config;
     client_frame_rate = config.framerate;
+    if (config.encodingFramerate > 0) {
+      requested_frame_rate = normalize_rational({
+        static_cast<UINT>(config.encodingFramerate),
+        1000,
+      });
+    } else {
+      requested_frame_rate = normalize_rational({
+        static_cast<UINT>(std::max(config.framerate, 1)),
+        1,
+      });
+    }
     dxgi::output6_t output6 {};
     status = output->QueryInterface(IID_IDXGIOutput6, (void **) &output6);
     if (SUCCEEDED(status)) {

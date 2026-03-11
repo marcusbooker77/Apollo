@@ -173,6 +173,8 @@ namespace platf::dxgi {
     int height_before_rotation;
 
     int client_frame_rate;
+    DXGI_RATIONAL requested_frame_rate {0, 1};
+    ::video::config_t init_config {};
 
     DXGI_FORMAT capture_format;
     D3D_FEATURE_LEVEL feature_level;
@@ -242,6 +244,7 @@ namespace platf::dxgi {
     const char *dxgi_format_to_string(DXGI_FORMAT format);
     const char *colorspace_to_string(DXGI_COLOR_SPACE_TYPE type);
     virtual std::vector<DXGI_FORMAT> get_supported_capture_formats() = 0;
+    virtual bool try_recover_after_reinit();
 
   protected:
     int get_pixel_pitch() {
@@ -313,6 +316,7 @@ namespace platf::dxgi {
     int init(const ::video::config_t &config, const std::string &display_name);
     capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
     capture_e release_snapshot() override;
+    bool try_recover_after_reinit() override;
 
     duplication_t dup;
     cursor_t cursor;
@@ -326,6 +330,7 @@ namespace platf::dxgi {
     int init(const ::video::config_t &config, const std::string &display_name);
     capture_e snapshot(const pull_free_image_cb_t &pull_free_image_cb, std::shared_ptr<platf::img_t> &img_out, std::chrono::milliseconds timeout, bool cursor_visible) override;
     capture_e release_snapshot() override;
+    bool try_recover_after_reinit() override;
 
     duplication_t dup;
     sampler_state_t sampler_linear;

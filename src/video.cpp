@@ -31,6 +31,7 @@ extern "C" {
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
 #include "performance_monitor.h"
+#include "stream.h"
 #include "sync.h"
 #include "telemetry.h"
 #include "video.h"
@@ -48,6 +49,38 @@ namespace video {
   namespace {
     inline uint64_t duration_us(std::chrono::steady_clock::duration duration) {
       return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+    }
+
+    constexpr int minimum_bitrate_reconfigure_delta_kbps = 250;
+
+    int compute_rc_buffer_size_bytes(const config_t &config, bool limit_rc_buffer_size, bool hardware, std::string_view encoder_name, int bitrate_bps, int slices_per_frame) {
+      if (!limit_rc_buffer_size) {
+        return 0;
+      }
+
+      int rc_buffer_size = 0;
+      if (!hardware && (slices_per_frame > 1 || config.videoFormat == 1)) {
+        rc_buffer_size = bitrate_bps / ((config.framerate * 10) / 15);
+      } else {
+        rc_buffer_size = bitrate_bps / config.framerate;
+
+#ifndef __APPLE__
+        if (encoder_name == "nvenc"sv && config::video.nv_legacy.vbv_percentage_increase > 0) {
+          rc_buffer_size += rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
+        }
+#endif
+      }
+
+      return rc_buffer_size;
+    }
+
+    bool try_set_bitrate_option(void *target, const char *name, int64_t value) {
+      if (!target) {
+        return false;
+      }
+
+      const auto status = av_opt_set_int(target, name, value, AV_OPT_SEARCH_CHILDREN);
+      return status >= 0;
     }
 
     template<class Packet>
@@ -90,6 +123,35 @@ namespace video {
       std::mutex mutex_;
       std::vector<Packet *> free_list_;
     };
+
+    void maybe_apply_runtime_bitrate_target(void *channel_data, encode_session_t &session, int &applied_bitrate_kbps, bool &bitrate_control_enabled) {
+      if (!bitrate_control_enabled || !channel_data) {
+        return;
+      }
+
+      auto *stream_session = static_cast<stream::session_t *>(channel_data);
+      const auto target_bitrate_kbps = stream::session::target_bitrate_kbps(*stream_session);
+      if (target_bitrate_kbps <= 0) {
+        return;
+      }
+
+      const auto bitrate_delta = target_bitrate_kbps > applied_bitrate_kbps ?
+        target_bitrate_kbps - applied_bitrate_kbps :
+        applied_bitrate_kbps - target_bitrate_kbps;
+      const auto required_delta = std::max(minimum_bitrate_reconfigure_delta_kbps, applied_bitrate_kbps / 20);
+      if (bitrate_delta < required_delta) {
+        return;
+      }
+
+      if (!session.update_bitrate_kbps(target_bitrate_kbps)) {
+        BOOST_LOG(warning) << "Disabling runtime bitrate updates after encoder reconfigure failure";
+        bitrate_control_enabled = false;
+        return;
+      }
+
+      applied_bitrate_kbps = target_bitrate_kbps;
+      stream::session::applied_bitrate_kbps(*stream_session, applied_bitrate_kbps);
+    }
   }
 
   /**
@@ -369,10 +431,23 @@ namespace video {
   public:
     avcodec_encode_session_t() = default;
 
-    avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject):
+    avcodec_encode_session_t(
+      avcodec_ctx_t &&avcodec_ctx,
+      std::unique_ptr<platf::avcodec_encode_device_t> encode_device,
+      int inject,
+      config_t config,
+      uint32_t encoder_flags,
+      std::string encoder_name,
+      bool hardware
+    ):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
-        inject {inject} {
+        inject {inject},
+        config {std::move(config)},
+        encoder_flags {encoder_flags},
+        encoder_name {std::move(encoder_name)},
+        hardware {hardware},
+        current_bitrate_kbps {this->config.bitrate} {
     }
 
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
@@ -399,6 +474,11 @@ namespace video {
       packet_pool = std::move(other.packet_pool);
 
       inject = other.inject;
+      config = std::move(other.config);
+      encoder_flags = other.encoder_flags;
+      encoder_name = std::move(other.encoder_name);
+      hardware = other.hardware;
+      current_bitrate_kbps = other.current_bitrate_kbps;
 
       return *this;
     }
@@ -408,6 +488,49 @@ namespace video {
         return -1;
       }
       return device->convert(img);
+    }
+
+    bool supports_runtime_bitrate_update() const override {
+      return static_cast<bool>(avcodec_ctx);
+    }
+
+    bool update_bitrate_kbps(int bitrate_kbps) override {
+      if (!avcodec_ctx || bitrate_kbps <= 0) {
+        return false;
+      }
+
+      if (bitrate_kbps == current_bitrate_kbps) {
+        return true;
+      }
+
+      const auto bitrate_bps = bitrate_kbps * 1000;
+      avcodec_ctx->rc_max_rate = bitrate_bps;
+      avcodec_ctx->bit_rate = bitrate_bps;
+
+      if (encoder_flags & CBR_WITH_VBR) {
+        avcodec_ctx->bit_rate = std::max<int64_t>(1, avcodec_ctx->bit_rate - 1);
+        avcodec_ctx->rc_min_rate = 0;
+      } else {
+        avcodec_ctx->rc_min_rate = bitrate_bps;
+      }
+
+      avcodec_ctx->rc_buffer_size = compute_rc_buffer_size_bytes(config, !(encoder_flags & NO_RC_BUF_LIMIT), hardware, encoder_name, bitrate_bps, avcodec_ctx->slices);
+
+      try_set_bitrate_option(avcodec_ctx.get(), "b", avcodec_ctx->bit_rate);
+      try_set_bitrate_option(avcodec_ctx.get(), "bit_rate", avcodec_ctx->bit_rate);
+      try_set_bitrate_option(avcodec_ctx.get(), "maxrate", avcodec_ctx->rc_max_rate);
+      try_set_bitrate_option(avcodec_ctx.get(), "minrate", avcodec_ctx->rc_min_rate);
+      try_set_bitrate_option(avcodec_ctx.get(), "bufsize", avcodec_ctx->rc_buffer_size);
+      try_set_bitrate_option(avcodec_ctx->priv_data, "b", avcodec_ctx->bit_rate);
+      try_set_bitrate_option(avcodec_ctx->priv_data, "bit_rate", avcodec_ctx->bit_rate);
+      try_set_bitrate_option(avcodec_ctx->priv_data, "maxrate", avcodec_ctx->rc_max_rate);
+      try_set_bitrate_option(avcodec_ctx->priv_data, "minrate", avcodec_ctx->rc_min_rate);
+      try_set_bitrate_option(avcodec_ctx->priv_data, "bufsize", avcodec_ctx->rc_buffer_size);
+
+      current_bitrate_kbps = bitrate_kbps;
+      request_idr_frame();
+      BOOST_LOG(info) << "Encoder bitrate updated to " << bitrate_kbps << " kbps";
+      return true;
     }
 
     int encode_frame(
@@ -449,13 +572,20 @@ namespace video {
     // inject sps/vps data into idr pictures
     int inject;
 
+    config_t config;
+    uint32_t encoder_flags = 0;
+    std::string encoder_name;
+    bool hardware = false;
+    int current_bitrate_kbps = 0;
+
     std::shared_ptr<packet_pool_t<packet_raw_avcodec>> packet_pool = std::make_shared<packet_pool_t<packet_raw_avcodec>>();
   };
 
   class nvenc_encode_session_t: public encode_session_t {
   public:
-    nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device):
-        device(std::move(encode_device)) {
+    nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device, int initial_bitrate_kbps):
+        device(std::move(encode_device)),
+        current_bitrate_kbps(initial_bitrate_kbps) {
     }
 
     int convert(platf::img_t &img) override {
@@ -463,6 +593,27 @@ namespace video {
         return -1;
       }
       return device->convert(img);
+    }
+
+    bool supports_runtime_bitrate_update() const override {
+      return device && device->nvenc;
+    }
+
+    bool update_bitrate_kbps(int bitrate_kbps) override {
+      if (!device || !device->nvenc || bitrate_kbps <= 0) {
+        return false;
+      }
+
+      if (bitrate_kbps == current_bitrate_kbps) {
+        return true;
+      }
+
+      if (!device->nvenc->reconfigure_bitrate(static_cast<uint32_t>(bitrate_kbps))) {
+        return false;
+      }
+
+      current_bitrate_kbps = bitrate_kbps;
+      return true;
     }
 
     int encode_frame(
@@ -503,6 +654,7 @@ namespace video {
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
+    int current_bitrate_kbps = 0;
     std::shared_ptr<packet_pool_t<packet_raw_generic>> packet_pool = std::make_shared<packet_pool_t<packet_raw_generic>>();
   };
 
@@ -522,6 +674,8 @@ namespace video {
   struct sync_session_t {
     sync_session_ctx_t *ctx;
     std::unique_ptr<encode_session_t> session;
+    int applied_bitrate_kbps = 0;
+    bool bitrate_control_enabled = false;
   };
 
   using encode_session_ctx_queue_t = safe::queue_t<sync_session_ctx_t>;
@@ -1851,21 +2005,7 @@ namespace video {
       }
 
       if (!(encoder.flags & NO_RC_BUF_LIMIT)) {
-        if (!hardware && (ctx->slices > 1 || config.videoFormat == 1)) {
-          // Use a larger rc_buffer_size for software encoding when slices are enabled,
-          // because libx264 can severely degrade quality if the buffer is too small.
-          // libx265 encounters this issue more frequently, so always scale the
-          // buffer by 1.5x for software HEVC encoding.
-          ctx->rc_buffer_size = bitrate / ((config.framerate * 10) / 15);
-        } else {
-          ctx->rc_buffer_size = bitrate / config.framerate;
-
-#ifndef __APPLE__
-          if (encoder.name == "nvenc" && config::video.nv_legacy.vbv_percentage_increase > 0) {
-            ctx->rc_buffer_size += ctx->rc_buffer_size * config::video.nv_legacy.vbv_percentage_increase / 100;
-          }
-#endif
-        }
+        ctx->rc_buffer_size = compute_rc_buffer_size_bytes(config, !(encoder.flags & NO_RC_BUF_LIMIT), hardware, encoder.name, bitrate, ctx->slices);
       }
 
       // Allow the encoding device a final opportunity to set/unset or override any options
@@ -1963,7 +2103,11 @@ namespace video {
       std::move(encode_device_final),
 
       // 0 ==> don't inject, 1 ==> inject for h264, 2 ==> inject for hevc
-      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0
+      config.videoFormat <= 1 ? (1 - (int) video_format[encoder_t::VUI_PARAMETERS]) * (1 + config.videoFormat) : 0,
+      config,
+      encoder.flags,
+      std::string {encoder.name},
+      hardware
     );
 
     return session;
@@ -1974,7 +2118,7 @@ namespace video {
       return nullptr;
     }
 
-    return std::make_unique<nvenc_encode_session_t>(std::move(encode_device));
+    return std::make_unique<nvenc_encode_session_t>(std::move(encode_device), client_config.bitrate);
   }
 
   std::unique_ptr<encode_session_t> make_encode_session(platf::display_t *disp, const encoder_t &encoder, const config_t &config, int width, int height, std::unique_ptr<platf::encode_device_t> encode_device) {
@@ -2003,6 +2147,12 @@ namespace video {
     auto session = make_encode_session(disp.get(), encoder, config, disp->width, disp->height, std::move(encode_device));
     if (!session) {
       return;
+    }
+
+    auto applied_bitrate_kbps = config.bitrate;
+    auto bitrate_control_enabled = session->supports_runtime_bitrate_update();
+    if (bitrate_control_enabled && channel_data) {
+      maybe_apply_runtime_bitrate_target(channel_data, *session, applied_bitrate_kbps, bitrate_control_enabled);
     }
 
     // As a workaround for NVENC hangs and to generally speed up encoder reinit,
@@ -2135,6 +2285,8 @@ namespace video {
         }
       }
 
+      maybe_apply_runtime_bitrate_target(channel_data, *session, applied_bitrate_kbps, bitrate_control_enabled);
+
       if (session->encode_frame(frame_nr++, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         break;
@@ -2263,6 +2415,8 @@ namespace video {
       return std::nullopt;
     }
 
+    encode_session.applied_bitrate_kbps = ctx.config.bitrate;
+    encode_session.bitrate_control_enabled = session->supports_runtime_bitrate_update();
     encode_session.session = std::move(session);
 
     return encode_session;
@@ -2384,6 +2538,8 @@ namespace video {
           if (img) {
             frame_timestamp = img->frame_timestamp;
           }
+
+          maybe_apply_runtime_bitrate_target(ctx->channel_data, *pos->session, pos->applied_bitrate_kbps, pos->bitrate_control_enabled);
 
           if (pos->session->encode_frame(ctx->frame_nr++, ctx->packets, ctx->channel_data, frame_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;

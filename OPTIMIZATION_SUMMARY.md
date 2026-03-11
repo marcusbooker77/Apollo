@@ -2,7 +2,7 @@
 
 **Project Start:** February 12, 2026
 **Latest Update:** March 11, 2026
-**Status:** Built, instrumented for real workload profiling, and extended with experimental tracing and browser transport labs
+**Status:** Built, instrumented for real workload profiling, extended with experimental tracing/browser transport labs, hardened against common stutter cases, and now supports live encoder bitrate reconfiguration
 **Total Performance Gain:** 30-50% improvement, plus runtime visibility for live stream analysis
 
 ---
@@ -15,6 +15,7 @@ This document details **all performance optimizations** implemented for Apollo (
 - **Phase 2 (Feb 13):** Runtime integration & additional optimizations
 - **Phase 3 (Mar 11):** Build stabilization, runtime metrics, and workload profiling
 - **Phase 4 (Mar 11):** Optional Tracy/OpenTelemetry integration, MsQuic probing, and WebTransport/WebCodecs lab surfaces
+- **Phase 5 (Mar 11):** Runtime stutter mitigation with capture-rate calibration, soft display recovery, and adaptive network control
 
 All optimizations leverage existing infrastructure or use well-established patterns to minimize risk while maximizing performance gains.
 
@@ -23,6 +24,32 @@ All optimizations leverage existing infrastructure or use well-established patte
 ## Phase 3: Runtime Profiling & Verification (Mar 11, 2026)
 
 ## Phase 4: Experimental Technology Integrations (Mar 11, 2026)
+
+## Phase 5: Runtime Stutter Mitigations (Mar 11, 2026)
+
+### Software Mitigations For Common Stutter Scenarios
+
+**Files Added/Modified:**
+- `src/platform/windows/display.h` / `src/platform/windows/display_base.cpp` - exact-rate capture pacing, observed-cadence calibration, and soft duplication recovery hooks
+- `src/platform/windows/display_ram.cpp` / `src/platform/windows/display_vram.cpp` - lightweight Desktop Duplication recovery without forcing a full stream restart
+- `src/stream.cpp` - per-session adaptive FEC, adaptive packet pacing, and adaptive bitrate targets driven by loss reports and sender pressure
+- `src/video.h` / `src/video.cpp` - runtime bitrate update hook in the encoder session interface plus encode-loop application of per-session bitrate targets
+- `src/nvenc/nvenc_base.h` / `src/nvenc/nvenc_base.cpp` - live NVENC bitrate reconfiguration through `NvEncReconfigureEncoder`
+- `src/config.h` / `src/config.cpp` - `adaptive_fec`, `adaptive_pacing`, and `adaptive_bitrate` config switches
+- `docs/configuration.md` - configuration docs for adaptive stream controls
+
+**What changed:**
+- capture pacing now preserves exact requested display rates instead of reducing everything to integer FPS, then refines pacing again from observed capture cadence
+- brief Desktop Duplication interruptions can now be recovered in-process for DDAPI paths before Apollo escalates to a full display reinitialization
+- video FEC can now climb or relax per session based on recent loss reports instead of staying fixed
+- packet pacing can now tighten or recover based on both client-reported loss and local send overshoot
+- encoder bitrate can now drop and recover live during a session instead of staying fixed at the initial RTSP-negotiated value
+
+**Intended effect:**
+- fewer periodic micro-stutters when the actual refresh cadence is `59.94`, `119.88`, or similarly non-integral
+- fewer large hiccups from short-lived DXGI/display invalidations
+- softer degradation on unstable Wi-Fi links by trading a little overhead and spacing for fewer visible stalls
+- reduced need for hard stream restarts on weak networks because NVENC sessions can now reconfigure bitrate in place
 
 ### Optional Observability And Transport Integrations
 

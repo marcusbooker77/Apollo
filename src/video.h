@@ -218,6 +218,10 @@ namespace video {
 
     virtual int convert(platf::img_t &img) = 0;
 
+    virtual bool supports_runtime_bitrate_update() const = 0;
+
+    virtual bool update_bitrate_kbps(int bitrate_kbps) = 0;
+
     virtual int encode_frame(
       int64_t frame_nr,
       safe::mail_raw_t::queue_t<packet_t> &packets,

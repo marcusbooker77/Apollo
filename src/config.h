@@ -170,6 +170,9 @@ namespace config {
     std::string file_apps;
 
     int fec_percentage;
+    bool adaptive_fec;
+    bool adaptive_pacing;
+    bool adaptive_bitrate;
 
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
