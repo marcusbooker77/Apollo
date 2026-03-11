@@ -64,3 +64,6 @@ include(${CMAKE_MODULE_PATH}/targets/common.cmake)
 
 # packaging
 include(${CMAKE_MODULE_PATH}/packaging/common.cmake)
+
+# Apollo performance optimizations
+include(${CMAKE_MODULE_PATH}/apollo_cmake_optimizations.cmake)

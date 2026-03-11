@@ -8,6 +8,7 @@
 #include <functional>
 #include <chrono>
 #include <string>
+#include <unordered_map>
 
 // local includes
 #include "thread_safe.h"
@@ -23,7 +24,7 @@ namespace confighttp {
 }  // namespace confighttp
 
 // mime types map
-const std::map<std::string, std::string> mime_types = {
+const std::unordered_map<std::string, std::string> mime_types = {
   {"css", "text/css"},
   {"gif", "image/gif"},
   {"htm", "text/html"},

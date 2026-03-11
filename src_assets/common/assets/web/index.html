@@ -71,6 +71,15 @@
       <Client-Card></Client-Card>
       <Resource-Card></Resource-Card>
     </div>
+    <div class="card p-2 my-4" v-if="experimentalFeatures?.server?.webtransport?.enabled">
+      <div class="card-body">
+        <h2>Experimental Streaming Lab</h2>
+        <p class="mt-3">
+          Inspect Tracy, OpenTelemetry, MsQuic, WebTransport, and WebCodecs support from one place.
+        </p>
+        <a class="btn btn-outline-primary" href="./experimental">Open Experimental Lab</a>
+      </div>
+    </div>
   </div>
 </body>
 
@@ -97,6 +106,7 @@
         preReleaseVersion: null,
         loading: true,
         logs: null,
+        experimentalFeatures: null,
       }
     },
     async created() {
@@ -116,6 +126,11 @@
       }
       try {
         this.logs = (await fetch("./api/logs").then(r => r.text()))
+      } catch (e) {
+        console.error(e);
+      }
+      try {
+        this.experimentalFeatures = await fetch("./api/experimental/features", { credentials: 'include' }).then((r) => r.json());
       } catch (e) {
         console.error(e);
       }

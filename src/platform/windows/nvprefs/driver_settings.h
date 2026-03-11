@@ -9,7 +9,10 @@
 // as <NvApiDriverSettings.h> needs types from <nvapi.h>
 // clang-format off
 #include <nvapi.h>
+// NvApiDriverSettings.h doesn't include SAL headers, so we need to include them
+#include <nvapi_lite_salstart.h>
 #include <NvApiDriverSettings.h>
+#include <nvapi_lite_salend.h>
 // clang-format on
 
 // local includes

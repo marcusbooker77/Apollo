@@ -97,12 +97,13 @@ namespace proc {
           // If the request was successful, wait for a little while for them to exit.
           BOOST_LOG(info) << "Successfully requested the app to exit. Waiting up to "sv << exit_timeout.count() << " seconds for it to close."sv;
 
-          // group::wait_for() and similar functions are broken and deprecated, so we use a simple polling loop
-          while (platf::process_group_running((std::uintptr_t) group.native_handle()) && (--exit_timeout).count() >= 0) {
-            std::this_thread::sleep_for(1s);
+          // group::wait_for() and similar functions are broken and deprecated, so we use a bounded polling loop
+          const auto deadline = std::chrono::steady_clock::now() + exit_timeout;
+          while (platf::process_group_running((std::uintptr_t) group.native_handle()) && std::chrono::steady_clock::now() < deadline) {
+            std::this_thread::sleep_for(100ms);
           }
 
-          if (exit_timeout.count() < 0) {
+          if (platf::process_group_running((std::uintptr_t) group.native_handle())) {
             BOOST_LOG(warning) << "App did not fully exit within the timeout. Terminating the app's remaining processes."sv;
           } else {
             BOOST_LOG(info) << "All app processes have successfully exited."sv;
@@ -178,7 +179,11 @@ namespace proc {
   int proc_t::execute(const ctx_t& app, std::shared_ptr<rtsp_stream::launch_session_t> launch_session) {
     if (_app_id == input_only_app_id) {
       terminate(false, false);
-      std::this_thread::sleep_for(1s);
+      constexpr auto wait_timeout = 1s;
+      const auto deadline = std::chrono::steady_clock::now() + wait_timeout;
+      while (std::chrono::steady_clock::now() < deadline && running()) {
+        std::this_thread::sleep_for(100ms);
+      }
     } else {
       // Ensure starting from a clean slate
       terminate(false, false);

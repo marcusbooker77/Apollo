@@ -24,6 +24,13 @@ macro(find_package)  # cmake-lint: disable=C0103
         # Do nothing, as the package has already been fetched
     else()
         # Call the original find_package function
+        if("${ARGV0_LOWER}" STREQUAL "boost" AND CMAKE_VERSION VERSION_GREATER_EQUAL "3.30")
+            cmake_policy(PUSH)
+            cmake_policy(SET CMP0167 NEW)
+            _find_package(${ARGV})
+            cmake_policy(POP)
+        else()
         _find_package(${ARGV})
+        endif()
     endif()
 endmacro()

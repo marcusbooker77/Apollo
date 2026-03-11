@@ -61,6 +61,16 @@ namespace nvenc {
     nvenc_encoded_frame encode_frame(uint64_t frame_index, bool force_idr);
 
     /**
+     * @brief Encode directly into a reusable packet buffer to avoid per-frame payload allocations.
+     * @param frame_index Frame index that uniquely identifies the frame.
+     * @param force_idr Whether to encode frame as forced IDR.
+     * @param encoded_packet Packet storage that receives the encoded payload bytes and metadata.
+     * @param after_ref_frame_invalidation Whether the frame confirms a successful RFI request.
+     * @return `true` on success, `false` on error.
+     */
+    bool encode_frame(uint64_t frame_index, bool force_idr, video::packet_raw_generic &encoded_packet, bool &after_ref_frame_invalidation);
+
+    /**
      * @brief Perform reference frame invalidation (RFI) procedure.
      * @param first_frame First frame index of the invalidation range.
      * @param last_frame Last frame index of the invalidation range.

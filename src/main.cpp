@@ -19,6 +19,7 @@
 #include "nvhttp.h"
 #include "process.h"
 #include "system_tray.h"
+#include "telemetry.h"
 #include "upnp.h"
 #include "uuid.h"
 #include "video.h"
@@ -172,6 +173,10 @@ int main(int argc, char *argv[]) {
   // if anything is logged prior to this point, it will appear in stdout, but not in the log viewer in the UI
   // the version should be printed to the log before anything else
   BOOST_LOG(info) << PROJECT_NAME << " version: " << PROJECT_VERSION << " commit: " << PROJECT_VERSION_COMMIT;
+  telemetry::initialize();
+  auto telemetry_shutdown_guard = util::fail_guard([]() {
+    telemetry::shutdown();
+  });
 
   // Log publisher metadata
   log_publisher_data();

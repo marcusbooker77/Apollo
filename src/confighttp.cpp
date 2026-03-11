@@ -35,8 +35,11 @@
 #include "logging.h"
 #include "network.h"
 #include "nvhttp.h"
+#include "performance_monitor.h"
 #include "platform/common.h"
 #include "process.h"
+#include "quic_transport.h"
+#include "telemetry.h"
 #include "utility.h"
 #include "uuid.h"
 
@@ -467,6 +470,26 @@ namespace confighttp {
     print_req(request);
 
     std::string content = file_handler::read_file(WEB_DIR "troubleshooting.html");
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "text/html; charset=utf-8");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    response->write(content, headers);
+  }
+
+  void getExperimentalPage(resp_https_t response, req_https_t request) {
+    if (!APOLLO_WEB_EXPERIMENTS) {
+      not_found(response, request);
+      return;
+    }
+
+    if (!authenticate(response, request, true)) {
+      return;
+    }
+
+    print_req(request);
+
+    std::string content = file_handler::read_file(WEB_DIR "experimental.html");
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "text/html; charset=utf-8");
     headers.emplace("X-Frame-Options", "DENY");
@@ -1154,6 +1177,72 @@ namespace confighttp {
     response->write(SimpleWeb::StatusCode::success_ok, content, headers);
   }
 
+  void getPerformanceMetrics(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    response->write(SimpleWeb::StatusCode::success_ok, perf::performance_monitor_t::instance().to_json(), headers);
+  }
+
+  void getPerformanceMetricsPrometheus(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "text/plain; version=0.0.4");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    response->write(SimpleWeb::StatusCode::success_ok, perf::performance_monitor_t::instance().to_prometheus(), headers);
+  }
+
+  void getExperimentalFeatures(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    print_req(request);
+
+    const auto telemetry_caps = telemetry::capabilities();
+    const auto quic_caps = quic::capabilities();
+
+    nlohmann::json output_tree;
+    output_tree["server"]["tracy"] = {
+      {"compiled", telemetry_caps.tracy_compiled},
+      {"active", telemetry_caps.tracy_active},
+    };
+    output_tree["server"]["opentelemetry"] = {
+      {"compiled", telemetry_caps.opentelemetry_compiled},
+      {"active", telemetry_caps.opentelemetry_active},
+      {"endpoint", telemetry_caps.opentelemetry_endpoint},
+    };
+    output_tree["server"]["msquic"] = {
+      {"compiled", quic_caps.compiled},
+      {"runtime_available", quic_caps.runtime_available},
+      {"alpn", quic_caps.alpn},
+      {"status", quic_caps.status},
+    };
+    output_tree["server"]["webtransport"] = {
+      {"enabled", telemetry_caps.web_experiments_enabled},
+      {"suggested_path", "/webtransport"},
+      {"status", quic_caps.runtime_available ? "Experimental WebTransport transport scaffolding can use the MsQuic runtime" : quic_caps.status},
+    };
+    output_tree["server"]["webcodecs"] = {
+      {"enabled", telemetry_caps.web_experiments_enabled},
+      {"status", telemetry_caps.web_experiments_enabled ? "Experimental browser codec lab is available" : "Experimental browser codec lab is disabled"},
+    };
+    send_response(response, output_tree);
+  }
+
   /**
    * @brief Update existing credentials.
    * @param response The HTTP response object.
@@ -1530,6 +1619,7 @@ namespace confighttp {
     server.resource["^/welcome/?$"]["GET"] = getWelcomePage;
     server.resource["^/login/?$"]["GET"] = getLoginPage;
     server.resource["^/troubleshooting/?$"]["GET"] = getTroubleshootingPage;
+    server.resource["^/experimental/?$"]["GET"] = getExperimentalPage;
     server.resource["^/api/login"]["POST"] = login;
     server.resource["^/api/pin$"]["POST"] = savePin;
     server.resource["^/api/otp$"]["POST"] = getOTP;
@@ -1540,6 +1630,9 @@ namespace confighttp {
     server.resource["^/api/apps/launch$"]["POST"] = launchApp;
     server.resource["^/api/apps/close$"]["POST"] = closeApp;
     server.resource["^/api/logs$"]["GET"] = getLogs;
+    server.resource["^/api/performance$"]["GET"] = getPerformanceMetrics;
+    server.resource["^/api/performance/prometheus$"]["GET"] = getPerformanceMetricsPrometheus;
+    server.resource["^/api/experimental/features$"]["GET"] = getExperimentalFeatures;
     server.resource["^/api/config$"]["GET"] = getConfig;
     server.resource["^/api/config$"]["POST"] = saveConfig;
     server.resource["^/api/configLocale$"]["GET"] = getLocale;

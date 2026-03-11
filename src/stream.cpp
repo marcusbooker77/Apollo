@@ -7,6 +7,8 @@
 #include <fstream>
 #include <future>
 #include <queue>
+#include <shared_mutex>
+#include <unordered_map>
 
 // lib includes
 #include <boost/endian/arithmetic.hpp>
@@ -29,9 +31,11 @@ extern "C" {
 #include "network.h"
 #include "platform/common.h"
 #include "process.h"
+#include "performance_monitor.h"
 #include "stream.h"
 #include "sync.h"
 #include "system_tray.h"
+#include "telemetry.h"
 #include "thread_safe.h"
 #include "utility.h"
 
@@ -311,6 +315,8 @@ namespace stream {
         return -1;
       }
 
+      perf::performance_monitor_t::instance().record_packet_sent(payload.size());
+
       return 0;
     }
 
@@ -321,11 +327,34 @@ namespace stream {
     // Callbacks
     std::unordered_map<std::uint16_t, std::function<void(session_t *, const std::string_view &)>> _map_type_cb;
 
-    // All active sessions (including those still waiting for a peer to connect)
-    sync_util::sync_t<std::vector<session_t *>> _sessions;
+    /**
+     * @brief All active sessions (including those still waiting for a peer to connect)
+     *
+     * OPTIMIZATION: Uses std::shared_mutex instead of std::mutex for better concurrency.
+     *
+     * Read-write lock allows multiple threads to read simultaneously while ensuring
+     * exclusive access for writes. This is ideal for session lookup which is read-heavy.
+     *
+     * Performance Impact:
+     * - Before: Exclusive lock on every session lookup (even reads block each other)
+     * - After: Concurrent reads, exclusive writes only
+     * - Expected: Better throughput with multiple simultaneous streams
+     */
+    sync_util::sync_t<std::vector<session_t *>, std::shared_mutex> _sessions;
 
-    // ENet peer to session mapping for sessions with a peer connected
-    sync_util::sync_t<std::map<net::peer_t, session_t *>> _peer_to_session;
+    /**
+     * @brief ENet peer to session mapping for sessions with a peer connected
+     *
+     * OPTIMIZATION: Uses std::shared_mutex for concurrent read access.
+     *
+     * This map is accessed on every incoming packet (fast path), so reducing
+     * lock contention here has significant impact on multi-client performance.
+     *
+     * See get_session() for usage: shared_lock() for lookups, unique_lock() for inserts.
+     */
+    sync_util::sync_t<std::map<net::peer_t, session_t *>, std::shared_mutex> _peer_to_session;
+    sync_util::sync_t<std::unordered_map<std::uint32_t, session_t *>, std::shared_mutex> _pending_by_connect_data;
+    sync_util::sync_t<std::unordered_map<std::string, session_t *>, std::shared_mutex> _pending_by_peer_address;
 
     ENetAddress _addr;
     net::host_t _host;
@@ -488,63 +517,94 @@ namespace stream {
   static auto broadcast = safe::make_shared<broadcast_ctx_t>(start_broadcast, end_broadcast);
 
   session_t *control_server_t::get_session(const net::peer_t peer, uint32_t connect_data) {
+    /**
+     * OPTIMIZATION: Fast path uses shared_lock() for concurrent read access.
+     *
+     * This is the hot path - called on every control packet. Most calls hit this
+     * path (existing session lookup). Using shared_lock allows multiple threads
+     * to perform lookups simultaneously without blocking each other.
+     *
+     * Before: auto lg = _peer_to_session.lock();  // Exclusive lock (blocks all other threads)
+     * After:  auto lg = _peer_to_session.shared_lock();  // Shared lock (concurrent reads OK)
+     */
     {
-      // Fast path - look up existing session by peer
-      auto lg = _peer_to_session.lock();
+      // Fast path - look up existing session by peer with shared lock (read-only)
+      auto lg = _peer_to_session.shared_lock();
       auto it = _peer_to_session->find(peer);
       if (it != _peer_to_session->end()) {
         return it->second;
       }
     }
 
-    // Slow path - process new session
     TUPLE_2D(peer_port, peer_addr, platf::from_sockaddr_ex((sockaddr *) &peer->address.address));
-    auto lg = _sessions.lock();
-    for (auto pos = std::begin(*_sessions); pos != std::end(*_sessions); ++pos) {
-      auto session_p = *pos;
+    session_t *session_p = nullptr;
 
-      // Skip sessions that are already established
-      if (session_p->control.peer) {
-        continue;
+    if (connect_data != 0) {
+      auto pending_lg = _pending_by_connect_data.shared_lock();
+      auto it = _pending_by_connect_data->find(connect_data);
+      if (it != _pending_by_connect_data->end()) {
+        session_p = it->second;
       }
-
-      // Identify the connection by the unique connect data if the client supports it.
-      // Only fall back to IP address matching for clients without session ID support.
-      if (session_p->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) {
-        if (session_p->control.connect_data != connect_data) {
-          continue;
-        } else {
-          BOOST_LOG(debug) << "Initialized new control stream session by connect data match [v2]"sv;
-        }
-      } else {
-        if (session_p->control.expected_peer_address != peer_addr) {
-          continue;
-        } else {
-          BOOST_LOG(debug) << "Initialized new control stream session by IP address match [v1]"sv;
-        }
-      }
-
-      // Once the control stream connection is established, RTSP session state can be torn down
-      rtsp_stream::launch_session_clear(session_p->launch_session_id);
-
-      session_p->control.peer = peer;
-
-      // Use the local address from the control connection as the source address
-      // for other communications to the client. This is necessary to ensure
-      // proper routing on multi-homed hosts.
-      auto local_address = platf::from_sockaddr((sockaddr *) &peer->localAddress.address);
-      session_p->localAddress = boost::asio::ip::make_address(local_address);
-
-      BOOST_LOG(debug) << "Control local address ["sv << local_address << ']';
-      BOOST_LOG(debug) << "Control peer address ["sv << peer_addr << ':' << peer_port << ']';
-
-      // Insert this into the map for O(1) lookups in the future
-      auto ptslg = _peer_to_session.lock();
-      _peer_to_session->emplace(peer, session_p);
-      return session_p;
     }
 
-    return nullptr;
+    if (!session_p) {
+      auto pending_lg = _pending_by_peer_address.shared_lock();
+      auto it = _pending_by_peer_address->find(peer_addr);
+      if (it != _pending_by_peer_address->end()) {
+        session_p = it->second;
+      }
+    }
+
+    if (!session_p) {
+      return nullptr;
+    }
+
+    auto lg = _sessions.unique_lock();
+    if (session_p->control.peer || session_p->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
+      return nullptr;
+    }
+
+    if (session_p->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) {
+      if (session_p->control.connect_data != connect_data) {
+        return nullptr;
+      }
+      BOOST_LOG(debug) << "Initialized new control stream session by connect data match [v2]"sv;
+    } else {
+      if (session_p->control.expected_peer_address != peer_addr) {
+        return nullptr;
+      }
+      BOOST_LOG(debug) << "Initialized new control stream session by IP address match [v1]"sv;
+    }
+
+    rtsp_stream::launch_session_clear(session_p->launch_session_id);
+
+    session_p->control.peer = peer;
+
+    auto local_address = platf::from_sockaddr((sockaddr *) &peer->localAddress.address);
+    session_p->localAddress = boost::asio::ip::make_address(local_address);
+
+    BOOST_LOG(debug) << "Control local address ["sv << local_address << ']';
+    BOOST_LOG(debug) << "Control peer address ["sv << peer_addr << ':' << peer_port << ']';
+
+    {
+      auto pending_lg = _pending_by_connect_data.unique_lock();
+      auto it = _pending_by_connect_data->find(session_p->control.connect_data);
+      if (it != _pending_by_connect_data->end() && it->second == session_p) {
+        _pending_by_connect_data->erase(it);
+      }
+    }
+
+    {
+      auto pending_lg = _pending_by_peer_address.unique_lock();
+      auto it = _pending_by_peer_address->find(session_p->control.expected_peer_address);
+      if (it != _pending_by_peer_address->end() && it->second == session_p) {
+        _pending_by_peer_address->erase(it);
+      }
+    }
+
+    auto ptslg = _peer_to_session.unique_lock();
+    _peer_to_session->emplace(peer, session_p);
+    return session_p;
   }
 
   /**
@@ -592,6 +652,7 @@ namespace stream {
         case ENET_EVENT_TYPE_RECEIVE:
           {
             net::packet_t packet {event.packet};
+            perf::performance_monitor_t::instance().record_packet_received(packet->dataLength);
 
             auto type = *(std::uint16_t *) packet->data;
             std::string_view payload {(char *) packet->data + sizeof(type), packet->dataLength - sizeof(type)};
@@ -647,6 +708,11 @@ namespace stream {
     };
 
     static fec_t encode(const std::string_view &payload, size_t blocksize, size_t fecpercentage, size_t minparityshards, size_t prefixsize) {
+      APOLLO_TRACY_SCOPE("stream.fec_encode");
+      telemetry::scoped_span_t fec_span("stream.fec_encode");
+      fec_span.set_attribute("payload_bytes", static_cast<uint64_t>(payload.size()));
+      fec_span.set_attribute("blocksize", static_cast<uint64_t>(blocksize));
+      fec_span.set_attribute("fec_percentage", static_cast<uint64_t>(fecpercentage));
       auto payload_size = payload.size();
 
       auto pad = payload_size % blocksize != 0;
@@ -732,13 +798,13 @@ namespace stream {
    * @param data1 The first data buffer.
    * @param data2 The second data buffer.
    */
-  std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
+  void concat_and_insert_into(std::vector<uint8_t> &result, uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
     auto data_size = data1.size() + data2.size();
     auto pad = data_size % slice_size != 0;
     auto elements = data_size / slice_size + (pad ? 1 : 0);
 
-    std::vector<uint8_t> result;
     result.resize(elements * insert_size + data_size);
+    std::fill(result.begin(), result.end(), 0);
 
     auto next = std::begin(data1);
     auto end = std::end(data1);
@@ -766,12 +832,10 @@ namespace stream {
         next += slice_size;
       }
     }
-
-    return result;
   }
 
-  std::vector<uint8_t> replace(const std::string_view &original, const std::string_view &old, const std::string_view &_new) {
-    std::vector<uint8_t> replaced;
+  void replace_into(std::vector<uint8_t> &replaced, const std::string_view &original, const std::string_view &old, const std::string_view &_new) {
+    replaced.clear();
     replaced.reserve(original.size() + _new.size() - old.size());
 
     auto begin = std::begin(original);
@@ -783,8 +847,6 @@ namespace stream {
       std::copy(std::begin(_new), std::end(_new), std::back_inserter(replaced));
       std::copy(next + old.size(), end, std::back_inserter(replaced));
     }
-
-    return replaced;
   }
 
   /**
@@ -946,6 +1008,9 @@ namespace stream {
       std::chrono::milliseconds t {stats[1]};
 
       auto lastGoodFrame = stats[3];
+      if (count > 0) {
+        perf::performance_monitor_t::instance().record_packet_lost(static_cast<uint64_t>(count));
+      }
 
       BOOST_LOG(verbose)
         << "type [IDX_LOSS_STATS]"sv << std::endl
@@ -1151,6 +1216,22 @@ namespace stream {
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
             pos = server->_sessions->erase(pos);
 
+            {
+              auto pending_lg = server->_pending_by_connect_data.lock();
+              auto it = server->_pending_by_connect_data->find(session->control.connect_data);
+              if (it != server->_pending_by_connect_data->end() && it->second == session) {
+                server->_pending_by_connect_data->erase(it);
+              }
+            }
+
+            {
+              auto pending_lg = server->_pending_by_peer_address.lock();
+              auto it = server->_pending_by_peer_address->find(session->control.expected_peer_address);
+              if (it != server->_pending_by_peer_address->end() && it->second == session) {
+                server->_pending_by_peer_address->erase(it);
+              }
+            }
+
             if (session->control.peer) {
               {
                 auto ptslg = server->_peer_to_session.lock();
@@ -1232,6 +1313,7 @@ namespace stream {
   }
 
   void recvThread(broadcast_ctx_t &ctx) {
+    telemetry::set_thread_name("apollo-recv");
     std::map<av_session_id_t, message_queue_t> peer_to_video_session;
     std::map<av_session_id_t, message_queue_t> peer_to_audio_session;
 
@@ -1279,7 +1361,9 @@ namespace stream {
         });
 
         auto type_str = buf_elem ? "AUDIO"sv : "VIDEO"sv;
-        BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+        if (logging::enabled(verbose.default_severity())) {
+          BOOST_LOG(verbose) << "Recv: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+        }
 
         populate_peer_to_session();
 
@@ -1293,11 +1377,15 @@ namespace stream {
           return;
         }
 
+        perf::performance_monitor_t::instance().record_packet_received(bytes);
+
         if (bytes == 4) {
           // For legacy PING packets, find the matching session by address.
           auto it = peer_to_session.find(peer.address());
           if (it != std::end(peer_to_session)) {
-            BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+            if (logging::enabled(debug.default_severity())) {
+              BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+            }
             it->second->raise(peer, std::string {buf[buf_elem].data(), bytes});
           }
         } else if (bytes >= sizeof(SS_PING)) {
@@ -1306,7 +1394,9 @@ namespace stream {
           // For new PING packets that include a client identifier, search by payload.
           auto it = peer_to_session.find(std::string {ping->payload, sizeof(ping->payload)});
           if (it != std::end(peer_to_session)) {
-            BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+            if (logging::enabled(debug.default_severity())) {
+              BOOST_LOG(debug) << "RAISE: "sv << peer.address().to_string() << ':' << peer.port() << " :: " << type_str;
+            }
             it->second->raise(peer, std::string {buf[buf_elem].data(), bytes});
           }
         }
@@ -1325,6 +1415,7 @@ namespace stream {
   }
 
   void videoBroadcastThread(udp::socket &sock) {
+    telemetry::set_thread_name("apollo-video-broadcast");
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<video::packet_t>(mail::video_packets);
     auto video_epoch = std::chrono::steady_clock::now();
@@ -1339,6 +1430,8 @@ namespace stream {
     logging::time_delta_periodic_logger frame_network_latency_logger(debug, "Network: frame's overall network latency");
 
     crypto::aes_t iv(12);
+    std::vector<uint8_t> payload_with_replacements;
+    std::vector<uint8_t> payload_with_headers;
 
     auto timer = platf::create_high_precision_timer();
     if (!timer || !*timer) {
@@ -1349,9 +1442,14 @@ namespace stream {
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
 
     while (auto packet = packets->pop()) {
+      APOLLO_TRACY_FRAME_MARK("apollo.video.network.frame");
       if (shutdown_event->peek()) {
         break;
       }
+
+      telemetry::scoped_span_t frame_span("stream.video_broadcast_frame");
+      frame_span.set_attribute("frame_index", static_cast<uint64_t>(packet->frame_index()));
+      frame_span.set_attribute("packet_bytes", static_cast<uint64_t>(packet->data_size()));
 
       frame_network_latency_logger.first_point_now();
 
@@ -1359,7 +1457,6 @@ namespace stream {
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
-      std::vector<uint8_t> payload_with_replacements;
 
       // Apply replacements on the packet payload before performing any other operations.
       // We need to know the final frame size to calculate the last packet size, and we
@@ -1370,7 +1467,7 @@ namespace stream {
           auto frame_old = replacement.old;
           auto frame_new = replacement._new;
 
-          payload_with_replacements = replace(payload, frame_old, frame_new);
+          replace_into(payload_with_replacements, payload, frame_old, frame_new);
           payload = {(char *) payload_with_replacements.data(), payload_with_replacements.size()};
         }
       }
@@ -1403,9 +1500,8 @@ namespace stream {
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
-
-      payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
+      concat_and_insert_into(payload_with_headers, sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      payload = std::string_view {(char *) payload_with_headers.data(), payload_with_headers.size()};
 
       // There are 2 bits for FEC block count for a maximum of 4 FEC blocks
       constexpr auto MAX_FEC_BLOCKS = 4;
@@ -1614,6 +1710,10 @@ namespace stream {
                 }
               }
               frame_send_batch_latency_logger.second_point_now_and_log();
+              perf::performance_monitor_t::instance().record_packet_batch_sent(
+                current_batch_size,
+                current_batch_size * (shards.prefixsize + shards.blocksize)
+              );
 
               ratecontrol_group_packets_sent += current_batch_size;
               ratecontrol_frame_packets_sent += current_batch_size;
@@ -1628,11 +1728,14 @@ namespace stream {
 
           frame_network_latency_logger.second_point_now_and_log();
 
-          BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
-                             << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
-                             << (frame_is_dupe ? " Dupe" : "")
-                             << (packet->is_idr() ? " Key" : "")
-                             << (packet->after_ref_frame_invalidation ? " RFI" : "");
+          if (logging::enabled(verbose.default_severity())) {
+            BOOST_LOG(verbose) << "Sent Frame seq ["sv << packet->frame_index() << "] pts ["sv << timestamp
+                               << "] shards ["sv << shards.size() << "/"sv << shards.percentage << "%]"sv
+                               << (frame_is_dupe ? " Dupe" : "")
+                               << (packet->is_idr() ? " Key" : "")
+                               << (packet->after_ref_frame_invalidation ? " RFI" : "");
+          }
+          perf::performance_monitor_t::instance().record_frame_transmitted();
 
           ++blockIndex;
           lowseq += shards.size();
@@ -1649,6 +1752,7 @@ namespace stream {
   }
 
   void audioBroadcastThread(udp::socket &sock) {
+    telemetry::set_thread_name("apollo-audio-broadcast");
     auto shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
     auto packets = mail::man->queue<audio::packet_t>(mail::audio_packets);
 
@@ -1692,7 +1796,9 @@ namespace stream {
         break;
       }
 
-      BOOST_LOG(verbose) << "Audio [seq "sv << sequenceNumber << ", pts "sv << timestamp << "] ::  send..."sv;
+      if (logging::enabled(verbose.default_severity())) {
+        BOOST_LOG(verbose) << "Audio [seq "sv << sequenceNumber << ", pts "sv << timestamp << "] ::  send..."sv;
+      }
 
       audio_packet.rtp.sequenceNumber = util::endian::big(sequenceNumber);
       audio_packet.rtp.timestamp = util::endian::big(timestamp);
@@ -1713,6 +1819,7 @@ namespace stream {
           session->localAddress,
         };
         platf::send(send_info);
+        perf::performance_monitor_t::instance().record_packet_sent(sizeof(audio_packet) + bytes);
 
         auto &fec_packet = session->audio.fec_packet;
         // initialize the FEC header at the beginning of the FEC block
@@ -1740,6 +1847,7 @@ namespace stream {
               session->localAddress,
             };
             platf::send(send_info);
+            perf::performance_monitor_t::instance().record_packet_sent(sizeof(fec_packet) + bytes);
             BOOST_LOG(verbose) << "Audio FEC ["sv << (sequenceNumber & ~(RTPA_DATA_SHARDS - 1)) << ' ' << x << "] ::  send..."sv;
           }
         }
@@ -2083,6 +2191,7 @@ namespace stream {
         platf::streaming_will_stop();
       }
 
+      perf::performance_monitor_t::instance().record_session_ended();
       BOOST_LOG(debug) << "Session ended"sv;
     }
 
@@ -2103,6 +2212,14 @@ namespace stream {
         session.broadcast_ref->control_server._sessions->push_back(&session);
       }
 
+      if (session.config.mlFeatureFlags & ML_FF_SESSION_ID_V1) {
+        auto pending_lg = session.broadcast_ref->control_server._pending_by_connect_data.lock();
+        (*session.broadcast_ref->control_server._pending_by_connect_data)[session.control.connect_data] = &session;
+      } else {
+        auto pending_lg = session.broadcast_ref->control_server._pending_by_peer_address.lock();
+        (*session.broadcast_ref->control_server._pending_by_peer_address)[session.control.expected_peer_address] = &session;
+      }
+
       auto addr = boost::asio::ip::make_address(addr_string);
       session.video.peer.address(addr);
       session.video.peer.port(0);
@@ -2116,6 +2233,7 @@ namespace stream {
       session.videoThread = std::thread {videoThread, &session};
 
       session.state.store(state_e::RUNNING, std::memory_order_relaxed);
+      perf::performance_monitor_t::instance().record_session_started();
 
       // If this is the first session, invoke the platform callbacks
       if (++running_sessions == 1) {

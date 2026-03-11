@@ -15,9 +15,19 @@ extern "C" {
 #include <libswscale/swscale.h>
 }
 
+#include <memory>
+
 struct AVPacket;
 
 namespace video {
+  struct packet_raw_t;
+  struct packet_recycler_t;
+
+  struct packet_deleter_t {
+    void operator()(packet_raw_t *packet) const noexcept;
+  };
+
+  using packet_t = std::unique_ptr<packet_raw_t, packet_deleter_t>;
 
   /* Encoding configuration requested by remote client */
   struct config_t {
@@ -208,6 +218,13 @@ namespace video {
 
     virtual int convert(platf::img_t &img) = 0;
 
+    virtual int encode_frame(
+      int64_t frame_nr,
+      safe::mail_raw_t::queue_t<packet_t> &packets,
+      void *channel_data,
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+    ) = 0;
+
     virtual void request_idr_frame() = 0;
 
     virtual void request_normal_frame() = 0;
@@ -236,6 +253,10 @@ namespace video {
 #endif
 
   struct packet_raw_t {
+    explicit packet_raw_t(std::weak_ptr<packet_recycler_t> recycler = {}):
+        recycler {std::move(recycler)} {
+    }
+
     virtual ~packet_raw_t() = default;
 
     virtual bool is_idr() = 0;
@@ -245,6 +266,18 @@ namespace video {
     virtual uint8_t *data() = 0;
 
     virtual size_t data_size() = 0;
+
+    virtual void reset_payload() noexcept = 0;
+
+    void reset_packet_state() noexcept {
+      reset_payload();
+      replacements = nullptr;
+      channel_data = nullptr;
+      after_ref_frame_invalidation = false;
+      frame_timestamp.reset();
+    }
+
+    void recycle() noexcept;
 
     struct replace_t {
       std::string_view old;
@@ -258,10 +291,16 @@ namespace video {
       }
     };
 
+    std::weak_ptr<packet_recycler_t> recycler;
     std::vector<replace_t> *replacements = nullptr;
     void *channel_data = nullptr;
     bool after_ref_frame_invalidation = false;
     std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
+  };
+
+  struct packet_recycler_t {
+    virtual ~packet_recycler_t() = default;
+    virtual void recycle(packet_raw_t *packet) noexcept = 0;
   };
 
   struct packet_raw_avcodec: packet_raw_t {
@@ -289,14 +328,32 @@ namespace video {
       return av_packet->size;
     }
 
+    void reset_payload() noexcept override {
+      av_packet_unref(av_packet);
+    }
+
     AVPacket *av_packet;
   };
 
   struct packet_raw_generic: packet_raw_t {
+    packet_raw_generic() = default;
+
     packet_raw_generic(std::vector<uint8_t> &&frame_data, int64_t frame_index, bool idr):
         frame_data {std::move(frame_data)},
         index {frame_index},
         idr {idr} {
+    }
+
+    void assign(std::vector<uint8_t> &&new_frame_data, int64_t frame_index, bool is_idr) {
+      frame_data = std::move(new_frame_data);
+      index = frame_index;
+      idr = is_idr;
+    }
+
+    void assign_copy(const uint8_t *new_frame_data, size_t new_frame_size, int64_t frame_index, bool is_idr) {
+      frame_data.assign(new_frame_data, new_frame_data + new_frame_size);
+      index = frame_index;
+      idr = is_idr;
     }
 
     bool is_idr() override {
@@ -315,12 +372,33 @@ namespace video {
       return frame_data.size();
     }
 
+    void reset_payload() noexcept override {
+      frame_data.clear();
+      index = 0;
+      idr = false;
+    }
+
     std::vector<uint8_t> frame_data;
-    int64_t index;
-    bool idr;
+    int64_t index {0};
+    bool idr {false};
   };
 
-  using packet_t = std::unique_ptr<packet_raw_t>;
+  inline void packet_raw_t::recycle() noexcept {
+    reset_packet_state();
+
+    if (auto packet_recycler = recycler.lock()) {
+      packet_recycler->recycle(this);
+      return;
+    }
+
+    delete this;
+  }
+
+  inline void packet_deleter_t::operator()(packet_raw_t *packet) const noexcept {
+    if (packet) {
+      packet->recycle();
+    }
+  }
 
   struct hdr_info_raw_t {
     explicit hdr_info_raw_t(bool enabled):

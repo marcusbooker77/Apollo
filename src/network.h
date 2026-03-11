@@ -48,6 +48,7 @@ namespace net {
   std::string_view to_enum_string(net_e net);
 
   net_e from_address(const std::string_view &view);
+  net_e from_address(boost::asio::ip::address address);
 
   host_t host_create(af_e af, ENetAddress &addr, std::uint16_t port);
 

@@ -223,10 +223,18 @@ namespace platf::dxgi {
       D3DKMT_HANDLE hAdapter;
     } D3DKMT_CLOSEADAPTER;
 
-    typedef NTSTATUS(WINAPI *PD3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
-    typedef NTSTATUS(WINAPI *PD3DKMTOpenAdapterFromLuid)(D3DKMT_OPENADAPTERFROMLUID *);
-    typedef NTSTATUS(WINAPI *PD3DKMTQueryAdapterInfo)(D3DKMT_QUERYADAPTERINFO *);
-    typedef NTSTATUS(WINAPI *PD3DKMTCloseAdapter)(D3DKMT_CLOSEADAPTER *);
+    // GCC/MinGW: Use long explicitly and omit calling convention (x64 has single calling convention)
+    #ifdef __GNUC__
+      typedef long (*PD3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
+      typedef long (*PD3DKMTOpenAdapterFromLuid)(D3DKMT_OPENADAPTERFROMLUID *);
+      typedef long (*PD3DKMTQueryAdapterInfo)(D3DKMT_QUERYADAPTERINFO *);
+      typedef long (*PD3DKMTCloseAdapter)(D3DKMT_CLOSEADAPTER *);
+    #else
+      typedef NTSTATUS(WINAPI *PD3DKMTSetProcessSchedulingPriorityClass)(HANDLE, D3DKMT_SCHEDULINGPRIORITYCLASS);
+      typedef NTSTATUS(WINAPI *PD3DKMTOpenAdapterFromLuid)(D3DKMT_OPENADAPTERFROMLUID *);
+      typedef NTSTATUS(WINAPI *PD3DKMTQueryAdapterInfo)(D3DKMT_QUERYADAPTERINFO *);
+      typedef NTSTATUS(WINAPI *PD3DKMTCloseAdapter)(D3DKMT_CLOSEADAPTER *);
+    #endif
 
     virtual bool is_hdr() override;
     virtual bool get_hdr_metadata(SS_HDR_METADATA &metadata) override;

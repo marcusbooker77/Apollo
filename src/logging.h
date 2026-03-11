@@ -27,6 +27,10 @@ extern boost::log::sources::severity_logger<int> tests;
  * @brief Handles the initialization and deinitialization of the logging system.
  */
 namespace logging {
+  inline bool enabled(int severity_level) {
+    return config::sunshine.min_log_level <= severity_level;
+  }
+
   class deinit_t {
   public:
     /**

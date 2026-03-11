@@ -31,11 +31,21 @@ else()
     # https://github.com/nocnokneo/cmake-git-versioning-example/blob/master/LICENSE
     find_package(Git)
     if(GIT_EXECUTABLE)
-        MESSAGE("${CMAKE_SOURCE_DIR}")
-        get_filename_component(SRC_DIR "${CMAKE_SOURCE_DIR}" DIRECTORY)
+        execute_process(
+                COMMAND ${GIT_EXECUTABLE} rev-parse --verify HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+                RESULT_VARIABLE GIT_HAS_HEAD
+                OUTPUT_QUIET
+                ERROR_QUIET
+        )
+
+        if(NOT GIT_HAS_HEAD EQUAL 0)
+            message(STATUS "Git repository has no commits yet; using default project version ${PROJECT_VERSION}")
+        else()
         #Get current Branch
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                 OUTPUT_VARIABLE GIT_DESCRIBE_BRANCH
                 RESULT_VARIABLE GIT_DESCRIBE_ERROR_CODE
                 OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -43,6 +53,7 @@ else()
         # Gather current commit
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                 OUTPUT_VARIABLE GIT_DESCRIBE_VERSION
                 RESULT_VARIABLE GIT_DESCRIBE_ERROR_CODE
                 OUTPUT_STRIP_TRAILING_WHITESPACE
@@ -50,6 +61,7 @@ else()
         # Check if Dirty
         execute_process(
                 COMMAND ${GIT_EXECUTABLE} diff -b --quiet --exit-code
+                WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
                 RESULT_VARIABLE GIT_IS_DIRTY
                 OUTPUT_STRIP_TRAILING_WHITESPACE
         )
@@ -64,7 +76,8 @@ else()
                 MESSAGE("Git tree is dirty!")
             endif()
         else()
-            MESSAGE(ERROR ": Got git error while fetching tags: ${GIT_DESCRIBE_ERROR_CODE}")
+            message(WARNING "Got git error while fetching version metadata: ${GIT_DESCRIBE_ERROR_CODE}")
+        endif()
         endif()
     else()
         MESSAGE(WARNING ": Git not found, cannot find git version")

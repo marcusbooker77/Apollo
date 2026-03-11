@@ -6,6 +6,8 @@
 #include <atomic>
 #include <bitset>
 #include <list>
+#include <memory>
+#include <mutex>
 #include <thread>
 
 // lib includes
@@ -28,7 +30,9 @@ extern "C" {
 #include "logging.h"
 #include "nvenc/nvenc_base.h"
 #include "platform/common.h"
+#include "performance_monitor.h"
 #include "sync.h"
+#include "telemetry.h"
 #include "video.h"
 
 #ifdef _WIN32
@@ -41,6 +45,52 @@ extern "C" {
 using namespace std::literals;
 
 namespace video {
+  namespace {
+    inline uint64_t duration_us(std::chrono::steady_clock::duration duration) {
+      return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(duration).count());
+    }
+
+    template<class Packet>
+    class packet_pool_t: public packet_recycler_t, public std::enable_shared_from_this<packet_pool_t<Packet>> {
+    public:
+      ~packet_pool_t() override {
+        for (auto *packet : free_list_) {
+          delete packet;
+        }
+      }
+
+      packet_t acquire() {
+        Packet *packet = nullptr;
+
+        {
+          std::lock_guard lg {mutex_};
+          if (!free_list_.empty()) {
+            packet = free_list_.back();
+            free_list_.pop_back();
+          }
+        }
+
+        if (!packet) {
+          packet = new Packet();
+        }
+
+        packet->recycler = this->weak_from_this();
+        packet->reset_packet_state();
+        return packet_t {packet};
+      }
+
+      void recycle(packet_raw_t *packet) noexcept override {
+        auto *typed_packet = static_cast<Packet *>(packet);
+
+        std::lock_guard lg {mutex_};
+        free_list_.push_back(typed_packet);
+      }
+
+    private:
+      std::mutex mutex_;
+      std::vector<Packet *> free_list_;
+    };
+  }
 
   /**
    * @brief Check if we can allow probing for the encoders.
@@ -136,34 +186,38 @@ namespace video {
   class avcodec_software_encode_device_t: public platf::avcodec_encode_device_t {
   public:
     int convert(platf::img_t &img) override {
-      // If we need to add aspect ratio padding, we need to scale into an intermediate output buffer
-      bool requires_padding = (sw_frame->width != sws_output_frame->width || sw_frame->height != sws_output_frame->height);
+      bool requires_padding = (sw_frame->width != scaled_width || sw_frame->height != scaled_height);
 
       // Setup the input frame using the caller's img_t
       sws_input_frame->data[0] = img.data;
       sws_input_frame->linesize[0] = img.row_pitch;
 
-      // Perform color conversion and scaling to the final size
-      auto status = sws_scale_frame(sws.get(), requires_padding ? sws_output_frame.get() : sw_frame.get(), sws_input_frame.get());
-      if (status < 0) {
-        char string[AV_ERROR_MAX_STRING_SIZE];
-        BOOST_LOG(error) << "Couldn't scale frame: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
-        return -1;
-      }
-
-      // If we require aspect ratio padding, copy the output frame into the final padded frame
       if (requires_padding) {
-        auto fmt_desc = av_pix_fmt_desc_get((AVPixelFormat) sws_output_frame->format);
-        auto planes = av_pix_fmt_count_planes((AVPixelFormat) sws_output_frame->format);
+        uint8_t *dst_data[4] = {nullptr, nullptr, nullptr, nullptr};
+        int dst_linesize[4] = {0, 0, 0, 0};
+
+        auto fmt_desc = av_pix_fmt_desc_get((AVPixelFormat) sw_frame->format);
+        auto planes = av_pix_fmt_count_planes((AVPixelFormat) sw_frame->format);
         for (int plane = 0; plane < planes; plane++) {
           auto shift_h = plane == 0 ? 0 : fmt_desc->log2_chroma_h;
           auto shift_w = plane == 0 ? 0 : fmt_desc->log2_chroma_w;
           auto offset = ((offsetW >> shift_w) * fmt_desc->comp[plane].step) + (offsetH >> shift_h) * sw_frame->linesize[plane];
+          dst_data[plane] = sw_frame->data[plane] + offset;
+          dst_linesize[plane] = sw_frame->linesize[plane];
+        }
 
-          // Copy line-by-line to preserve leading padding for each row
-          for (int line = 0; line < sws_output_frame->height >> shift_h; line++) {
-            memcpy(sw_frame->data[plane] + offset + (line * sw_frame->linesize[plane]), sws_output_frame->data[plane] + (line * sws_output_frame->linesize[plane]), (size_t) (sws_output_frame->width >> shift_w) * fmt_desc->comp[plane].step);
-          }
+        auto status = sws_scale(sws.get(), sws_input_frame->data, sws_input_frame->linesize, 0, sws_input_frame->height, dst_data, dst_linesize);
+        if (status < 0) {
+          char string[AV_ERROR_MAX_STRING_SIZE];
+          BOOST_LOG(error) << "Couldn't scale frame: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+          return -1;
+        }
+      } else {
+        auto status = sws_scale_frame(sws.get(), sw_frame.get(), sws_input_frame.get());
+        if (status < 0) {
+          char string[AV_ERROR_MAX_STRING_SIZE];
+          BOOST_LOG(error) << "Couldn't scale frame: "sv << av_make_error_string(string, AV_ERROR_MAX_STRING_SIZE, status);
+          return -1;
         }
       }
 
@@ -242,10 +296,8 @@ namespace video {
       sws_input_frame->height = in_height;
       sws_input_frame->format = AV_PIX_FMT_BGR0;
 
-      sws_output_frame.reset(av_frame_alloc());
-      sws_output_frame->width = out_width;
-      sws_output_frame->height = out_height;
-      sws_output_frame->format = format;
+      scaled_width = out_width;
+      scaled_height = out_height;
 
       // Result is always positive
       offsetW = (frame->width - out_width) / 2;
@@ -260,9 +312,9 @@ namespace video {
       av_dict_set_int(&options, "srcw", sws_input_frame->width, 0);
       av_dict_set_int(&options, "srch", sws_input_frame->height, 0);
       av_dict_set_int(&options, "src_format", sws_input_frame->format, 0);
-      av_dict_set_int(&options, "dstw", sws_output_frame->width, 0);
-      av_dict_set_int(&options, "dsth", sws_output_frame->height, 0);
-      av_dict_set_int(&options, "dst_format", sws_output_frame->format, 0);
+      av_dict_set_int(&options, "dstw", scaled_width, 0);
+      av_dict_set_int(&options, "dsth", scaled_height, 0);
+      av_dict_set_int(&options, "dst_format", format, 0);
       av_dict_set_int(&options, "sws_flags", SWS_LANCZOS | SWS_ACCURATE_RND, 0);
       av_dict_set_int(&options, "threads", config::video.min_threads, 0);
 
@@ -289,12 +341,13 @@ namespace video {
 
     avcodec_frame_t sw_frame;
     avcodec_frame_t sws_input_frame;
-    avcodec_frame_t sws_output_frame;
     sws_t sws;
 
     // Offset of input image to output frame in pixels
     int offsetW;
     int offsetH;
+    int scaled_width;
+    int scaled_height;
   };
 
   enum flag_e : uint32_t {
@@ -343,6 +396,7 @@ namespace video {
       replacements = std::move(other.replacements);
       sps = std::move(other.sps);
       vps = std::move(other.vps);
+      packet_pool = std::move(other.packet_pool);
 
       inject = other.inject;
 
@@ -355,6 +409,13 @@ namespace video {
       }
       return device->convert(img);
     }
+
+    int encode_frame(
+      int64_t frame_nr,
+      safe::mail_raw_t::queue_t<packet_t> &packets,
+      void *channel_data,
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+    ) override;
 
     void request_idr_frame() override {
       if (device && device->frame) {
@@ -387,6 +448,8 @@ namespace video {
 
     // inject sps/vps data into idr pictures
     int inject;
+
+    std::shared_ptr<packet_pool_t<packet_raw_avcodec>> packet_pool = std::make_shared<packet_pool_t<packet_raw_avcodec>>();
   };
 
   class nvenc_encode_session_t: public encode_session_t {
@@ -401,6 +464,13 @@ namespace video {
       }
       return device->convert(img);
     }
+
+    int encode_frame(
+      int64_t frame_nr,
+      safe::mail_raw_t::queue_t<packet_t> &packets,
+      void *channel_data,
+      std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+    ) override;
 
     void request_idr_frame() override {
       force_idr = true;
@@ -420,12 +490,12 @@ namespace video {
       }
     }
 
-    nvenc::nvenc_encoded_frame encode_frame(uint64_t frame_index) {
+    bool encode_device_frame(uint64_t frame_index, packet_raw_generic &encoded_packet, bool &after_ref_frame_invalidation) {
       if (!device || !device->nvenc) {
-        return {};
+        return false;
       }
 
-      auto result = device->nvenc->encode_frame(frame_index, force_idr);
+      auto result = device->nvenc->encode_frame(frame_index, force_idr, encoded_packet, after_ref_frame_invalidation);
       force_idr = false;
       return result;
     }
@@ -433,6 +503,7 @@ namespace video {
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;
+    std::shared_ptr<packet_pool_t<packet_raw_generic>> packet_pool = std::make_shared<packet_pool_t<packet_raw_generic>>();
   };
 
   struct sync_session_ctx_t {
@@ -1404,32 +1475,42 @@ namespace video {
     }
   }
 
-  int encode_avcodec(int64_t frame_nr, avcodec_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    auto &frame = session.device->frame;
+  int avcodec_encode_session_t::encode_frame(
+    int64_t frame_nr,
+    safe::mail_raw_t::queue_t<packet_t> &packets,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+  ) {
+    APOLLO_TRACY_SCOPE("video.avcodec_encode_frame");
+    telemetry::scoped_span_t encode_span("video.avcodec_encode_frame");
+    encode_span.set_attribute("frame_nr", frame_nr);
+    const auto encode_start = std::chrono::steady_clock::now();
+    auto &frame = device->frame;
     frame->pts = frame_nr;
+    size_t total_bytes = 0;
 
-    auto &ctx = session.avcodec_ctx;
-
-    auto &sps = session.sps;
-    auto &vps = session.vps;
+    auto &ctx = avcodec_ctx;
 
     // send the frame to the encoder
     auto ret = avcodec_send_frame(ctx.get(), frame);
     if (ret < 0) {
       char err_str[AV_ERROR_MAX_STRING_SIZE] {0};
       BOOST_LOG(error) << "Could not send a frame for encoding: "sv << av_make_error_string(err_str, AV_ERROR_MAX_STRING_SIZE, ret);
+      perf::performance_monitor_t::instance().record_encoding_error();
 
       return -1;
     }
 
     while (ret >= 0) {
-      auto packet = std::make_unique<packet_raw_avcodec>();
-      auto av_packet = packet.get()->av_packet;
+      auto packet = packet_pool->acquire();
+      auto *packet_avcodec = static_cast<packet_raw_avcodec *>(packet.get());
+      auto av_packet = packet_avcodec->av_packet;
 
       ret = avcodec_receive_packet(ctx.get(), av_packet);
       if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
         return 0;
       } else if (ret < 0) {
+        perf::performance_monitor_t::instance().record_encoding_error();
         return ret;
       }
 
@@ -1441,8 +1522,8 @@ namespace video {
         BOOST_LOG(error) << "Encoder did not produce IDR frame when requested!"sv;
       }
 
-      if (session.inject) {
-        if (session.inject == 1) {
+      if (inject) {
+        if (inject == 1) {
           auto h264 = cbs::make_sps_h264(ctx.get(), av_packet);
 
           sps = std::move(h264.sps);
@@ -1452,15 +1533,15 @@ namespace video {
           sps = std::move(hevc.sps);
           vps = std::move(hevc.vps);
 
-          session.replacements.emplace_back(
+          replacements.emplace_back(
             std::string_view((char *) std::begin(vps.old), vps.old.size()),
             std::string_view((char *) std::begin(vps._new), vps._new.size())
           );
         }
 
-        session.inject = 0;
+        inject = 0;
 
-        session.replacements.emplace_back(
+        replacements.emplace_back(
           std::string_view((char *) std::begin(sps.old), sps.old.size()),
           std::string_view((char *) std::begin(sps._new), sps._new.size())
         );
@@ -1470,42 +1551,50 @@ namespace video {
         packet->frame_timestamp = frame_timestamp;
       }
 
-      packet->replacements = &session.replacements;
+      packet->replacements = &replacements;
       packet->channel_data = channel_data;
+      total_bytes += static_cast<size_t>(av_packet->size);
       packets->raise(std::move(packet));
     }
 
+    if (total_bytes > 0) {
+      perf::performance_monitor_t::instance().record_frame_encode(duration_us(std::chrono::steady_clock::now() - encode_start), total_bytes);
+    }
+
     return 0;
   }
 
-  int encode_nvenc(int64_t frame_nr, nvenc_encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    auto encoded_frame = session.encode_frame(frame_nr);
-    if (encoded_frame.data.empty()) {
+  int nvenc_encode_session_t::encode_frame(
+    int64_t frame_nr,
+    safe::mail_raw_t::queue_t<packet_t> &packets,
+    void *channel_data,
+    std::optional<std::chrono::steady_clock::time_point> frame_timestamp
+  ) {
+    APOLLO_TRACY_SCOPE("video.nvenc_encode_frame");
+    telemetry::scoped_span_t encode_span("video.nvenc_encode_frame");
+    encode_span.set_attribute("frame_nr", frame_nr);
+    const auto encode_start = std::chrono::steady_clock::now();
+    auto packet = packet_pool->acquire();
+    auto *packet_generic = static_cast<packet_raw_generic *>(packet.get());
+    bool after_ref_frame_invalidation = false;
+    if (!encode_device_frame(frame_nr, *packet_generic, after_ref_frame_invalidation) || packet_generic->data_size() == 0) {
       BOOST_LOG(error) << "NvENC returned empty packet";
+      perf::performance_monitor_t::instance().record_encoding_error();
       return -1;
     }
 
-    if (frame_nr != encoded_frame.frame_index) {
-      BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << encoded_frame.frame_index;
+    if (frame_nr != packet_generic->frame_index()) {
+      BOOST_LOG(error) << "NvENC frame index mismatch " << frame_nr << " " << packet_generic->frame_index();
     }
 
-    auto packet = std::make_unique<packet_raw_generic>(std::move(encoded_frame.data), encoded_frame.frame_index, encoded_frame.idr);
     packet->channel_data = channel_data;
-    packet->after_ref_frame_invalidation = encoded_frame.after_ref_frame_invalidation;
+    packet->after_ref_frame_invalidation = after_ref_frame_invalidation;
     packet->frame_timestamp = frame_timestamp;
+    const auto encoded_size = packet->data_size();
     packets->raise(std::move(packet));
+    perf::performance_monitor_t::instance().record_frame_encode(duration_us(std::chrono::steady_clock::now() - encode_start), encoded_size);
 
     return 0;
-  }
-
-  int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
-    } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
-    }
-
-    return -1;
   }
 
   std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(
@@ -1962,7 +2051,7 @@ namespace video {
       BOOST_LOG(info) << "Input only session, video will not be captured."sv;
 
       // Encode the dummy img only once
-      if (encode(frame_nr++, *session, packets, channel_data, std::chrono::steady_clock::now())) {
+      if (session->encode_frame(frame_nr++, packets, channel_data, std::chrono::steady_clock::now())) {
         BOOST_LOG(error) << "Could not encode dummy video packet"sv;
         return;
       }
@@ -2022,13 +2111,17 @@ namespace video {
 
           // If new frame comes in way too fast, just drop
           if (time_diff < -frame_variation_threshold) {
+            perf::performance_monitor_t::instance().record_frame_dropped();
             continue;
           }
 
+          const auto convert_start = std::chrono::steady_clock::now();
           if (session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
+            perf::performance_monitor_t::instance().record_capture_error();
             break;
           }
+          perf::performance_monitor_t::instance().record_frame_capture(duration_us(std::chrono::steady_clock::now() - convert_start));
 
           if (time_diff < frame_variation_threshold) {
             *frame_timestamp = encode_frame_timestamp;
@@ -2042,9 +2135,12 @@ namespace video {
         }
       }
 
-      if (encode(frame_nr++, *session, packets, channel_data, frame_timestamp)) {
+      if (session->encode_frame(frame_nr++, packets, channel_data, frame_timestamp)) {
         BOOST_LOG(error) << "Could not encode video packet"sv;
         break;
+      }
+      if (frame_timestamp) {
+        perf::performance_monitor_t::instance().record_frame_total(duration_us(std::chrono::steady_clock::now() - *frame_timestamp));
       }
 
       session->request_normal_frame();
@@ -2219,6 +2315,7 @@ namespace video {
     }
 
     std::vector<sync_session_t> synced_sessions;
+    synced_sessions.reserve(synced_session_ctxs.size());
     for (auto &ctx : synced_session_ctxs) {
       auto synced_session = make_synced_session(disp.get(), encoder, *img, *ctx);
       if (!synced_session) {
@@ -2238,6 +2335,7 @@ namespace video {
           }
 
           synced_session_ctxs.emplace_back(std::make_unique<sync_session_ctx_t>(std::move(*encode_session_ctx)));
+          synced_sessions.reserve(synced_session_ctxs.size());
 
           auto encode_session = make_synced_session(disp.get(), encoder, *img, *synced_session_ctxs.back());
           if (!encode_session) {
@@ -2254,10 +2352,9 @@ namespace video {
             // Let waiting thread know it can delete shutdown_event
             ctx->join_event->raise(true);
 
+            const auto index = static_cast<std::size_t>(std::distance(std::begin(synced_sessions), pos));
             pos = synced_sessions.erase(pos);
-            synced_session_ctxs.erase(std::find_if(std::begin(synced_session_ctxs), std::end(synced_session_ctxs), [&ctx_p = ctx](auto &ctx) {
-              return ctx.get() == ctx_p;
-            }));
+            synced_session_ctxs.erase(std::begin(synced_session_ctxs) + index);
 
             if (synced_sessions.empty()) {
               return false;
@@ -2271,11 +2368,16 @@ namespace video {
             ctx->idr_events->pop();
           }
 
+          const auto convert_start = std::chrono::steady_clock::now();
           if (frame_captured && pos->session->convert(*img)) {
             BOOST_LOG(error) << "Could not convert image"sv;
+            perf::performance_monitor_t::instance().record_capture_error();
             ctx->shutdown_event->raise(true);
 
             continue;
+          }
+          if (frame_captured) {
+            perf::performance_monitor_t::instance().record_frame_capture(duration_us(std::chrono::steady_clock::now() - convert_start));
           }
 
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
@@ -2283,11 +2385,14 @@ namespace video {
             frame_timestamp = img->frame_timestamp;
           }
 
-          if (encode(ctx->frame_nr++, *pos->session, ctx->packets, ctx->channel_data, frame_timestamp)) {
+          if (pos->session->encode_frame(ctx->frame_nr++, ctx->packets, ctx->channel_data, frame_timestamp)) {
             BOOST_LOG(error) << "Could not encode video packet"sv;
             ctx->shutdown_event->raise(true);
 
             continue;
+          }
+          if (frame_timestamp) {
+            perf::performance_monitor_t::instance().record_frame_total(duration_us(std::chrono::steady_clock::now() - *frame_timestamp));
           }
 
           pos->session->request_normal_frame();
@@ -2324,6 +2429,7 @@ namespace video {
   }
 
   void captureThreadSync() {
+    telemetry::set_thread_name("apollo-capture-sync");
     auto ref = capture_thread_sync.ref();
 
     std::vector<std::unique_ptr<sync_session_ctx_t>> synced_session_ctxs;
@@ -2356,6 +2462,7 @@ namespace video {
     config_t &config,
     void *channel_data
   ) {
+    telemetry::set_thread_name("apollo-capture-async");
     auto shutdown_event = mail->event<bool>(mail::shutdown);
 
     auto images = std::make_shared<img_event_t::element_type>();
@@ -2492,7 +2599,7 @@ namespace video {
 
     auto packets = mail::man->queue<packet_t>(mail::video_packets);
     while (!packets->peek()) {
-      if (encode(1, *session, packets, nullptr, {})) {
+      if (session->encode_frame(1, packets, nullptr, {})) {
         return -1;
       }
     }

@@ -90,6 +90,7 @@ list(PREPEND PLATFORM_LIBRARIES
         libwinpthread.a
         minhook::minhook
         ntdll
+        pdh
         setupapi
         shlwapi
         synchronization.lib

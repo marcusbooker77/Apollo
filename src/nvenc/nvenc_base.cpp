@@ -487,9 +487,9 @@ namespace nvenc {
     encoder_params = {};
   }
 
-  nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
+  bool nvenc_base::encode_frame(uint64_t frame_index, bool force_idr, video::packet_raw_generic &encoded_packet, bool &after_ref_frame_invalidation) {
     if (!encoder) {
-      return {};
+      return false;
     }
 
     assert(registered_input_buffer);
@@ -497,7 +497,7 @@ namespace nvenc {
 
     if (!synchronize_input_buffer()) {
       BOOST_LOG(error) << "NvEnc: failed to synchronize input buffer";
-      return {};
+      return false;
     }
 
     NV_ENC_MAP_INPUT_RESOURCE mapped_input_buffer = {min_struct_version(NV_ENC_MAP_INPUT_RESOURCE_VER)};
@@ -505,7 +505,7 @@ namespace nvenc {
 
     if (nvenc_failed(nvenc->nvEncMapInputResource(encoder, &mapped_input_buffer))) {
       BOOST_LOG(error) << "NvEnc: NvEncMapInputResource() failed: " << last_nvenc_error_string;
-      return {};
+      return false;
     }
     auto unmap_guard = util::fail_guard([&] {
       if (nvenc_failed(nvenc->nvEncUnmapInputResource(encoder, mapped_input_buffer.mappedResource))) {
@@ -526,7 +526,7 @@ namespace nvenc {
 
     if (nvenc_failed(nvenc->nvEncEncodePicture(encoder, &pic_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncEncodePicture() failed: " << last_nvenc_error_string;
-      return {};
+      return false;
     }
 
     NV_ENC_LOCK_BITSTREAM lock_bitstream = {min_struct_version(NV_ENC_LOCK_BITSTREAM_VER, 1, 2)};
@@ -535,21 +535,22 @@ namespace nvenc {
 
     if (async_event_handle && !wait_for_async_event(100)) {
       BOOST_LOG(error) << "NvEnc: frame " << frame_index << " encode wait timeout";
-      return {};
+      return false;
     }
 
     if (nvenc_failed(nvenc->nvEncLockBitstream(encoder, &lock_bitstream))) {
       BOOST_LOG(error) << "NvEnc: NvEncLockBitstream() failed: " << last_nvenc_error_string;
-      return {};
+      return false;
     }
 
     auto data_pointer = (uint8_t *) lock_bitstream.bitstreamBufferPtr;
-    nvenc_encoded_frame encoded_frame {
-      {data_pointer, data_pointer + lock_bitstream.bitstreamSizeInBytes},
+    after_ref_frame_invalidation = encoder_state.rfi_needs_confirmation;
+    encoded_packet.assign_copy(
+      data_pointer,
+      lock_bitstream.bitstreamSizeInBytes,
       lock_bitstream.outputTimeStamp,
-      lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR,
-      encoder_state.rfi_needs_confirmation,
-    };
+      lock_bitstream.pictureType == NV_ENC_PIC_TYPE_IDR
+    );
 
     if (encoder_state.rfi_needs_confirmation) {
       // Invalidation request has been fulfilled, and video network packet will be marked as such
@@ -558,17 +559,32 @@ namespace nvenc {
 
     encoder_state.last_encoded_frame_index = frame_index;
 
-    if (encoded_frame.idr) {
-      BOOST_LOG(debug) << "NvEnc: idr frame " << encoded_frame.frame_index;
+    if (encoded_packet.is_idr()) {
+      BOOST_LOG(debug) << "NvEnc: idr frame " << encoded_packet.frame_index();
     }
 
     if (nvenc_failed(nvenc->nvEncUnlockBitstream(encoder, lock_bitstream.outputBitstream))) {
       BOOST_LOG(error) << "NvEnc: NvEncUnlockBitstream() failed: " << last_nvenc_error_string;
     }
 
-    encoder_state.frame_size_logger.collect_and_log(encoded_frame.data.size() / 1000.);
+    encoder_state.frame_size_logger.collect_and_log(encoded_packet.data_size() / 1000.);
 
-    return encoded_frame;
+    return true;
+  }
+
+  nvenc_encoded_frame nvenc_base::encode_frame(uint64_t frame_index, bool force_idr) {
+    video::packet_raw_generic encoded_packet;
+    bool after_ref_frame_invalidation = false;
+    if (!encode_frame(frame_index, force_idr, encoded_packet, after_ref_frame_invalidation)) {
+      return {};
+    }
+
+    return {
+      std::move(encoded_packet.frame_data),
+      static_cast<uint64_t>(encoded_packet.frame_index()),
+      encoded_packet.is_idr(),
+      after_ref_frame_invalidation,
+    };
   }
 
   bool nvenc_base::invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame) {

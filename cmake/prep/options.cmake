@@ -12,6 +12,10 @@ option(BUILD_TESTS "Build tests" OFF)
 option(NPM_OFFLINE "Use offline npm packages. You must ensure packages are in your npm cache." OFF)
 
 option(BUILD_WERROR "Enable -Werror flag." OFF)
+option(APOLLO_ENABLE_TRACY "Enable optional Tracy profiling instrumentation." OFF)
+option(APOLLO_ENABLE_OPENTELEMETRY "Enable optional OpenTelemetry tracing export if a suitable SDK is available." OFF)
+option(APOLLO_ENABLE_MSQUIC "Enable experimental MsQuic runtime probing and QUIC transport scaffolding on Windows." OFF)
+option(APOLLO_ENABLE_WEB_EXPERIMENTS "Build experimental WebTransport and WebCodecs lab pages in the Web UI." ON)
 
 # if this option is set, the build will exit after configuring special package configuration files
 option(SUNSHINE_CONFIGURE_ONLY "Configure special files only, then exit." OFF)

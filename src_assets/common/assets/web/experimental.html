@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en" data-bs-theme="auto">
+
+<head>
+  <%- header %>
+</head>
+
+<body id="app" v-cloak>
+  <Navbar></Navbar>
+  <div class="container">
+    <h1 class="my-4">Experimental Streaming Lab</h1>
+    <p class="mb-4">
+      This page exposes the new tracing and experimental transport work. It is intended for validation and prototyping,
+      not as the default streaming path.
+    </p>
+
+    <div class="card p-2 my-4">
+      <div class="card-body">
+        <div class="d-flex justify-content-between align-items-center">
+          <h2 class="mb-0">Server Features</h2>
+          <button class="btn btn-outline-secondary" @click="refreshFeatures">Refresh</button>
+        </div>
+        <div class="mt-3" v-if="serverFeatures">
+          <pre class="mb-0">{{ JSON.stringify(serverFeatures, null, 2) }}</pre>
+        </div>
+        <div class="mt-3" v-else>Loading server feature data...</div>
+      </div>
+    </div>
+
+    <div class="card p-2 my-4">
+      <div class="card-body">
+        <h2>Browser APIs</h2>
+        <ul class="mt-3">
+          <li>Secure context: <strong>{{ browserSupport.secureContext ? 'yes' : 'no' }}</strong></li>
+          <li>WebTransport: <strong>{{ browserSupport.webTransport ? 'yes' : 'no' }}</strong></li>
+          <li>VideoDecoder: <strong>{{ browserSupport.videoDecoder ? 'yes' : 'no' }}</strong></li>
+          <li>VideoEncoder: <strong>{{ browserSupport.videoEncoder ? 'yes' : 'no' }}</strong></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="card p-2 my-4">
+      <div class="card-body">
+        <h2>WebCodecs Probe</h2>
+        <button class="btn btn-primary mt-3" :disabled="checkingCodecs || !browserSupport.videoDecoder" @click="probeCodecs">
+          {{ checkingCodecs ? 'Checking...' : 'Check Decoder Support' }}
+        </button>
+        <div class="table-responsive mt-3" v-if="codecResults.length">
+          <table class="table table-striped">
+            <thead>
+              <tr>
+                <th>Codec</th>
+                <th>Supported</th>
+                <th>Config</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="result in codecResults" :key="result.codec">
+                <td>{{ result.codec }}</td>
+                <td>{{ result.supported ? 'yes' : 'no' }}</td>
+                <td><code>{{ result.description }}</code></td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <div class="card p-2 my-4">
+      <div class="card-body">
+        <h2>WebTransport Probe</h2>
+        <p class="mt-3">
+          This is a browser-side handshake test only. The production Apollo streaming path still uses the existing native transport.
+        </p>
+        <label class="form-label mt-2" for="wt-url">Endpoint</label>
+        <input id="wt-url" class="form-control" v-model="webTransportUrl" />
+        <button class="btn btn-primary mt-3" :disabled="probingTransport || !browserSupport.webTransport" @click="probeTransport">
+          {{ probingTransport ? 'Probing...' : 'Probe WebTransport' }}
+        </button>
+        <div class="alert mt-3" :class="transportStatus.ok ? 'alert-success' : 'alert-secondary'" v-if="transportStatus.message">
+          {{ transportStatus.message }}
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module">
+    import { createApp } from 'vue'
+    import { initApp } from './init'
+    import Navbar from './Navbar.vue'
+
+    const codecCandidates = [
+      {
+        codec: 'H.264 High',
+        description: 'avc1.640028 / Annex B',
+        config: {
+          codec: 'avc1.640028',
+          codedWidth: 1920,
+          codedHeight: 1080,
+          optimizeForLatency: true,
+        },
+      },
+      {
+        codec: 'HEVC Main',
+        description: 'hev1.1.6.L153.B0',
+        config: {
+          codec: 'hev1.1.6.L153.B0',
+          codedWidth: 1920,
+          codedHeight: 1080,
+          optimizeForLatency: true,
+        },
+      },
+      {
+        codec: 'AV1 Main',
+        description: 'av01.0.08M.08',
+        config: {
+          codec: 'av01.0.08M.08',
+          codedWidth: 1920,
+          codedHeight: 1080,
+          optimizeForLatency: true,
+        },
+      },
+    ];
+
+    const app = createApp({
+      components: {
+        Navbar,
+      },
+      data() {
+        return {
+          browserSupport: {
+            secureContext: window.isSecureContext,
+            webTransport: typeof WebTransport !== 'undefined',
+            videoDecoder: typeof VideoDecoder !== 'undefined',
+            videoEncoder: typeof VideoEncoder !== 'undefined',
+          },
+          checkingCodecs: false,
+          codecResults: [],
+          probingTransport: false,
+          serverFeatures: null,
+          transportStatus: {
+            ok: false,
+            message: '',
+          },
+          webTransportUrl: `${window.location.origin}/webtransport`,
+        };
+      },
+      async created() {
+        await this.refreshFeatures();
+      },
+      methods: {
+        async refreshFeatures() {
+          this.serverFeatures = await fetch('./api/experimental/features', {
+            credentials: 'include',
+          }).then((response) => response.json());
+        },
+        async probeCodecs() {
+          this.checkingCodecs = true;
+          this.codecResults = [];
+
+          try {
+            for (const candidate of codecCandidates) {
+              let supported = false;
+              if (this.browserSupport.videoDecoder) {
+                try {
+                  const result = await VideoDecoder.isConfigSupported(candidate.config);
+                  supported = !!result.supported;
+                } catch (error) {
+                  supported = false;
+                }
+              }
+
+              this.codecResults.push({
+                codec: candidate.codec,
+                description: candidate.description,
+                supported,
+              });
+            }
+          } finally {
+            this.checkingCodecs = false;
+          }
+        },
+        async probeTransport() {
+          this.probingTransport = true;
+          this.transportStatus = {
+            ok: false,
+            message: '',
+          };
+
+          try {
+            const transport = new WebTransport(this.webTransportUrl);
+            await transport.ready;
+            this.transportStatus = {
+              ok: true,
+              message: `Connected to ${this.webTransportUrl}. The browser and server accepted a WebTransport handshake.`,
+            };
+            await transport.close();
+          } catch (error) {
+            this.transportStatus = {
+              ok: false,
+              message: `WebTransport probe failed: ${error.message}`,
+            };
+          } finally {
+            this.probingTransport = false;
+          }
+        },
+      },
+    });
+
+    initApp(app);
+  </script>
+</body>
+
+</html>

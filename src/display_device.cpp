@@ -12,8 +12,9 @@
 #include <display_device/json.h>
 #include <display_device/retry_scheduler.h>
 #include <display_device/settings_manager_interface.h>
+#include <charconv>
+#include <limits>
 #include <mutex>
-#include <regex>
 
 // local includes
 #include "audio.h"
@@ -115,18 +116,15 @@ namespace display_device {
       RetryScheduler<boost::optional<audio_context_t>> context_scheduler {std::make_unique<boost::optional<audio_context_t>>(boost::none)};
     };
 
-    /**
-     * @brief Convert string to unsigned int.
-     * @note For random reason there is std::stoi, but not std::stou...
-     * @param value String to be converted
-     * @return Parsed unsigned integer.
-     */
-    unsigned int stou(const std::string &value) {
-      unsigned long result {std::stoul(value)};
-      if (result > std::numeric_limits<unsigned int>::max()) {
-        throw std::out_of_range("stou");
+    bool parse_unsigned(std::string_view value, unsigned int &output) {
+      if (value.empty()) {
+        return false;
       }
-      return result;
+
+      const auto *begin = value.data();
+      const auto *end = begin + value.size();
+      auto [ptr, ec] = std::from_chars(begin, end, output);
+      return ec == std::errc {} && ptr == end;
     }
 
     /**
@@ -149,31 +147,27 @@ namespace display_device {
      */
     bool parse_resolution_string(const std::string &input, std::optional<Resolution> &output) {
       const std::string trimmed_input {boost::algorithm::trim_copy(input)};
-      const std::regex resolution_regex {R"(^(\d+)x(\d+)$)"};
-
-      if (std::smatch match; std::regex_match(trimmed_input, match, resolution_regex)) {
-        try {
-          output = Resolution {
-            stou(match[1].str()),
-            stou(match[2].str())
-          };
-          return true;
-        } catch (const std::out_of_range &) {
-          BOOST_LOG(error) << "Failed to parse resolution string " << trimmed_input << " (number out of range).";
-        } catch (const std::exception &err) {
-          BOOST_LOG(error) << "Failed to parse resolution string " << trimmed_input << ":\n"
-                           << err.what();
-        }
-      } else {
-        if (trimmed_input.empty()) {
-          output = std::nullopt;
-          return true;
-        }
-
-        BOOST_LOG(error) << "Failed to parse resolution string " << trimmed_input << R"(. It must match a "1920x1080" pattern!)";
+      if (trimmed_input.empty()) {
+        output = std::nullopt;
+        return true;
       }
 
-      return false;
+      const auto separator_pos = trimmed_input.find('x');
+      if (separator_pos == std::string::npos || trimmed_input.find('x', separator_pos + 1) != std::string::npos) {
+        BOOST_LOG(error) << "Failed to parse resolution string " << trimmed_input << R"(. It must match a "1920x1080" pattern!)";
+        return false;
+      }
+
+      unsigned int width {};
+      unsigned int height {};
+      if (!parse_unsigned(std::string_view(trimmed_input).substr(0, separator_pos), width) ||
+          !parse_unsigned(std::string_view(trimmed_input).substr(separator_pos + 1), height)) {
+        BOOST_LOG(error) << "Failed to parse resolution string " << trimmed_input << R"(. It must match a "1920x1080" pattern!)";
+        return false;
+      }
+
+      output = Resolution {width, height};
+      return true;
     }
 
     /**
@@ -196,65 +190,76 @@ namespace display_device {
      * @examples_end
      */
     bool parse_refresh_rate_string(const std::string &input, std::optional<FloatingPoint> &output, const bool allow_decimal_point = true) {
-      static const auto is_zero {[](const auto &character) {
-        return character == '0';
-      }};
       const std::string trimmed_input {boost::algorithm::trim_copy(input)};
-      const std::regex refresh_rate_regex {allow_decimal_point ? R"(^(\d+)(?:\.(\d+))?$)" : R"(^(\d+)$)"};
-
-      if (std::smatch match; std::regex_match(trimmed_input, match, refresh_rate_regex)) {
-        try {
-          // Here we are trimming zeros from the string to possibly reduce out of bounds case
-          std::string trimmed_match_1 {boost::algorithm::trim_left_copy_if(match[1].str(), is_zero)};
-          if (trimmed_match_1.empty()) {
-            trimmed_match_1 = "0"s;  // Just in case ALL the string is full of zeros, we want to leave one
-          }
-
-          std::string trimmed_match_2;
-          if (allow_decimal_point && match[2].matched) {
-            trimmed_match_2 = boost::algorithm::trim_right_copy_if(match[2].str(), is_zero);
-          }
-
-          if (!trimmed_match_2.empty()) {
-            // We have a decimal point and will have to split it into numerator and denominator.
-            // For example:
-            //   59.995:
-            //     numerator = 59995
-            //     denominator = 1000
-
-            // We are essentially removing the decimal point here: 59.995 -> 59995
-            const std::string numerator_str {trimmed_match_1 + trimmed_match_2};
-            const auto numerator {stou(numerator_str)};
-
-            // Here we are counting decimal places and calculating denominator: 10^decimal_places
-            const auto denominator {static_cast<unsigned int>(std::pow(10, trimmed_match_2.size()))};
-
-            output = Rational {numerator, denominator};
-          } else {
-            // We do not have a decimal point, just a valid number.
-            // For example:
-            //   60:
-            //     numerator = 60
-            //     denominator = 1
-            output = Rational {stou(trimmed_match_1), 1};
-          }
-          return true;
-        } catch (const std::out_of_range &) {
-          BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << " (number out of range).";
-        } catch (const std::exception &err) {
-          BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ":\n"
-                           << err.what();
-        }
-      } else {
-        if (trimmed_input.empty()) {
-          output = std::nullopt;
-          return true;
-        }
-
-        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << (allow_decimal_point ? R"("123" or "123.456")" : R"("123")") << "!";
+      if (trimmed_input.empty()) {
+        output = std::nullopt;
+        return true;
       }
 
-      return false;
+      const auto decimal_pos = trimmed_input.find('.');
+      if (!allow_decimal_point && decimal_pos != std::string::npos) {
+        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << R"("123")" << "!";
+        return false;
+      }
+
+      if (decimal_pos != std::string::npos && trimmed_input.find('.', decimal_pos + 1) != std::string::npos) {
+        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << (allow_decimal_point ? R"("123" or "123.456")" : R"("123")") << "!";
+        return false;
+      }
+
+      auto whole_part = std::string_view(trimmed_input);
+      auto fractional_part = std::string_view {};
+      if (decimal_pos != std::string::npos) {
+        whole_part = whole_part.substr(0, decimal_pos);
+        fractional_part = std::string_view(trimmed_input).substr(decimal_pos + 1);
+        if (whole_part.empty() || fractional_part.empty()) {
+          BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << (allow_decimal_point ? R"("123" or "123.456")" : R"("123")") << "!";
+          return false;
+        }
+      }
+
+      unsigned int numerator {};
+      if (!parse_unsigned(whole_part, numerator)) {
+        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << (allow_decimal_point ? R"("123" or "123.456")" : R"("123")") << "!";
+        return false;
+      }
+
+      if (fractional_part.empty()) {
+        output = Rational {numerator, 1};
+        return true;
+      }
+
+      while (!fractional_part.empty() && fractional_part.back() == '0') {
+        fractional_part.remove_suffix(1);
+      }
+
+      if (fractional_part.empty()) {
+        output = Rational {numerator, 1};
+        return true;
+      }
+
+      unsigned int fractional_value {};
+      if (!parse_unsigned(fractional_part, fractional_value)) {
+        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << ". Must have a pattern of " << (allow_decimal_point ? R"("123" or "123.456")" : R"("123")") << "!";
+        return false;
+      }
+
+      unsigned int denominator {1};
+      for (size_t i = 0; i < fractional_part.size(); ++i) {
+        if (denominator > std::numeric_limits<unsigned int>::max() / 10) {
+          BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << " (number out of range).";
+          return false;
+        }
+        denominator *= 10;
+      }
+
+      if (numerator > (std::numeric_limits<unsigned int>::max() - fractional_value) / denominator) {
+        BOOST_LOG(error) << "Failed to parse refresh rate string " << trimmed_input << " (number out of range).";
+        return false;
+      }
+
+      output = Rational {numerator * denominator + fractional_value, denominator};
+      return true;
     }
 
     /**
