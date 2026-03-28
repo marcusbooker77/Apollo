@@ -1182,6 +1182,16 @@ namespace confighttp {
     response->write(SimpleWeb::StatusCode::success_ok, content, headers);
   }
 
+  // Cached metrics to avoid regenerating on every poll (1-second TTL)
+  struct metrics_cache_t {
+    std::mutex mutex;
+    std::string json_cache;
+    std::string prometheus_cache;
+    std::chrono::steady_clock::time_point json_time {};
+    std::chrono::steady_clock::time_point prometheus_time {};
+    static constexpr auto TTL = std::chrono::seconds(1);
+  } metrics_cache;
+
   void getPerformanceMetrics(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) {
       return;
@@ -1189,11 +1199,22 @@ namespace confighttp {
 
     print_req(request);
 
+    std::string body;
+    {
+      std::lock_guard<std::mutex> lock(metrics_cache.mutex);
+      auto now = std::chrono::steady_clock::now();
+      if (now - metrics_cache.json_time > metrics_cache_t::TTL) {
+        metrics_cache.json_cache = perf::performance_monitor_t::instance().to_json();
+        metrics_cache.json_time = now;
+      }
+      body = metrics_cache.json_cache;
+    }
+
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "application/json");
     headers.emplace("X-Frame-Options", "DENY");
     headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(SimpleWeb::StatusCode::success_ok, perf::performance_monitor_t::instance().to_json(), headers);
+    response->write(SimpleWeb::StatusCode::success_ok, body, headers);
   }
 
   void getPerformanceMetricsPrometheus(resp_https_t response, req_https_t request) {
@@ -1203,11 +1224,22 @@ namespace confighttp {
 
     print_req(request);
 
+    std::string body;
+    {
+      std::lock_guard<std::mutex> lock(metrics_cache.mutex);
+      auto now = std::chrono::steady_clock::now();
+      if (now - metrics_cache.prometheus_time > metrics_cache_t::TTL) {
+        metrics_cache.prometheus_cache = perf::performance_monitor_t::instance().to_prometheus();
+        metrics_cache.prometheus_time = now;
+      }
+      body = metrics_cache.prometheus_cache;
+    }
+
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "text/plain; version=0.0.4");
     headers.emplace("X-Frame-Options", "DENY");
     headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
-    response->write(SimpleWeb::StatusCode::success_ok, perf::performance_monitor_t::instance().to_prometheus(), headers);
+    response->write(SimpleWeb::StatusCode::success_ok, body, headers);
   }
 
   void getExperimentalFeatures(resp_https_t response, req_https_t request) {

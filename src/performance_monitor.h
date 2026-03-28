@@ -507,79 +507,97 @@ public:
      * @brief Generate Prometheus-compatible metrics
      */
     std::string to_prometheus() const {
-        std::string output;
-        auto uptime = uptime_seconds();
+        const auto uptime = uptime_seconds();
         const auto encode = video_.frame_encode_time.snapshot();
         const auto rtt = network_.rtt_ms.snapshot();
-        
-        // Video metrics
-        output += "# HELP apollo_frames_captured_total Total frames captured\n";
-        output += "# TYPE apollo_frames_captured_total counter\n";
-        output += "apollo_frames_captured_total " + std::to_string(video_.frames_captured.load()) + "\n\n";
-        
-        output += "# HELP apollo_frames_encoded_total Total frames encoded\n";
-        output += "# TYPE apollo_frames_encoded_total counter\n";
-        output += "apollo_frames_encoded_total " + std::to_string(video_.frames_encoded.load()) + "\n\n";
-        
-        output += "# HELP apollo_encode_time_us_mean Mean encoding time in microseconds\n";
-        output += "# TYPE apollo_encode_time_us_mean gauge\n";
-        output += "apollo_encode_time_us_mean " + std::to_string(encode.count > 0 ? encode.sum / encode.count : 0.0) + "\n\n";
-        
-        output += "# HELP apollo_fps Frames per second\n";
-        output += "# TYPE apollo_fps gauge\n";
-        output += "apollo_fps " + std::to_string(uptime > 0 ? video_.frames_encoded.load() / uptime : 0.0) + "\n\n";
 
-        output += "# HELP apollo_active_sessions Current active streaming sessions\n";
-        output += "# TYPE apollo_active_sessions gauge\n";
-        output += "apollo_active_sessions " + std::to_string(sessions_.active_sessions.load()) + "\n\n";
+        // Snapshot all atomics once to avoid redundant loads
+        const auto frames_captured = video_.frames_captured.load();
+        const auto frames_encoded = video_.frames_encoded.load();
+        const auto active_sessions = sessions_.active_sessions.load();
+        const auto sessions_started = sessions_.sessions_started.load();
+        const auto sessions_ended = sessions_.sessions_ended.load();
+        const auto packets_sent = network_.packets_sent.load();
+        const auto packets_lost = network_.packets_lost.load();
+        const auto cpu_pct = resources_.cpu_usage_percent.load();
+        const auto mem_bytes = resources_.memory_used_bytes.load();
+        const auto gpu_avail = resources_.gpu_usage_available.load() ? 1 : 0;
+        const auto gpu_pct = resources_.gpu_usage_percent.load();
+        const auto gpu_mem_avail = resources_.gpu_memory_available.load() ? 1 : 0;
+        const auto gpu_mem_bytes = resources_.gpu_memory_used_bytes.load();
 
-        output += "# HELP apollo_sessions_started_total Total streaming sessions started\n";
-        output += "# TYPE apollo_sessions_started_total counter\n";
-        output += "apollo_sessions_started_total " + std::to_string(sessions_.sessions_started.load()) + "\n\n";
+        char buffer[4096];
+        int written = snprintf(buffer, sizeof(buffer),
+            "# HELP apollo_frames_captured_total Total frames captured\n"
+            "# TYPE apollo_frames_captured_total counter\n"
+            "apollo_frames_captured_total %llu\n\n"
+            "# HELP apollo_frames_encoded_total Total frames encoded\n"
+            "# TYPE apollo_frames_encoded_total counter\n"
+            "apollo_frames_encoded_total %llu\n\n"
+            "# HELP apollo_encode_time_us_mean Mean encoding time in microseconds\n"
+            "# TYPE apollo_encode_time_us_mean gauge\n"
+            "apollo_encode_time_us_mean %.6f\n\n"
+            "# HELP apollo_fps Frames per second\n"
+            "# TYPE apollo_fps gauge\n"
+            "apollo_fps %.2f\n\n"
+            "# HELP apollo_active_sessions Current active streaming sessions\n"
+            "# TYPE apollo_active_sessions gauge\n"
+            "apollo_active_sessions %llu\n\n"
+            "# HELP apollo_sessions_started_total Total streaming sessions started\n"
+            "# TYPE apollo_sessions_started_total counter\n"
+            "apollo_sessions_started_total %llu\n\n"
+            "# HELP apollo_sessions_ended_total Total streaming sessions ended\n"
+            "# TYPE apollo_sessions_ended_total counter\n"
+            "apollo_sessions_ended_total %llu\n\n"
+            "# HELP apollo_packets_sent_total Total packets sent\n"
+            "# TYPE apollo_packets_sent_total counter\n"
+            "apollo_packets_sent_total %llu\n\n"
+            "# HELP apollo_packets_lost_total Total packets lost\n"
+            "# TYPE apollo_packets_lost_total counter\n"
+            "apollo_packets_lost_total %llu\n\n"
+            "# HELP apollo_rtt_ms_mean Mean round-trip time in milliseconds\n"
+            "# TYPE apollo_rtt_ms_mean gauge\n"
+            "apollo_rtt_ms_mean %.6f\n\n"
+            "# HELP apollo_cpu_usage_percent CPU usage percentage\n"
+            "# TYPE apollo_cpu_usage_percent gauge\n"
+            "apollo_cpu_usage_percent %.2f\n\n"
+            "# HELP apollo_memory_used_bytes Memory used in bytes\n"
+            "# TYPE apollo_memory_used_bytes gauge\n"
+            "apollo_memory_used_bytes %llu\n\n"
+            "# HELP apollo_gpu_usage_available Whether GPU utilization sampling is available on this system\n"
+            "# TYPE apollo_gpu_usage_available gauge\n"
+            "apollo_gpu_usage_available %d\n\n"
+            "# HELP apollo_gpu_usage_percent GPU usage percentage\n"
+            "# TYPE apollo_gpu_usage_percent gauge\n"
+            "apollo_gpu_usage_percent %.2f\n\n"
+            "# HELP apollo_gpu_memory_available Whether GPU memory sampling is available on this system\n"
+            "# TYPE apollo_gpu_memory_available gauge\n"
+            "apollo_gpu_memory_available %d\n\n"
+            "# HELP apollo_gpu_memory_used_bytes GPU memory used in bytes\n"
+            "# TYPE apollo_gpu_memory_used_bytes gauge\n"
+            "apollo_gpu_memory_used_bytes %llu\n\n",
+            frames_captured,
+            frames_encoded,
+            encode.count > 0 ? encode.sum / encode.count : 0.0,
+            uptime > 0 ? frames_encoded / uptime : 0.0,
+            active_sessions,
+            sessions_started,
+            sessions_ended,
+            packets_sent,
+            packets_lost,
+            rtt.count > 0 ? rtt.sum / rtt.count : 0.0,
+            cpu_pct,
+            mem_bytes,
+            gpu_avail,
+            gpu_pct,
+            gpu_mem_avail,
+            gpu_mem_bytes
+        );
 
-        output += "# HELP apollo_sessions_ended_total Total streaming sessions ended\n";
-        output += "# TYPE apollo_sessions_ended_total counter\n";
-        output += "apollo_sessions_ended_total " + std::to_string(sessions_.sessions_ended.load()) + "\n\n";
-        
-        // Network metrics
-        output += "# HELP apollo_packets_sent_total Total packets sent\n";
-        output += "# TYPE apollo_packets_sent_total counter\n";
-        output += "apollo_packets_sent_total " + std::to_string(network_.packets_sent.load()) + "\n\n";
-        
-        output += "# HELP apollo_packets_lost_total Total packets lost\n";
-        output += "# TYPE apollo_packets_lost_total counter\n";
-        output += "apollo_packets_lost_total " + std::to_string(network_.packets_lost.load()) + "\n\n";
-        
-        output += "# HELP apollo_rtt_ms_mean Mean round-trip time in milliseconds\n";
-        output += "# TYPE apollo_rtt_ms_mean gauge\n";
-        output += "apollo_rtt_ms_mean " + std::to_string(rtt.count > 0 ? rtt.sum / rtt.count : 0.0) + "\n\n";
-        
-        // Resource metrics
-        output += "# HELP apollo_cpu_usage_percent CPU usage percentage\n";
-        output += "# TYPE apollo_cpu_usage_percent gauge\n";
-        output += "apollo_cpu_usage_percent " + std::to_string(resources_.cpu_usage_percent.load()) + "\n\n";
-        
-        output += "# HELP apollo_memory_used_bytes Memory used in bytes\n";
-        output += "# TYPE apollo_memory_used_bytes gauge\n";
-        output += "apollo_memory_used_bytes " + std::to_string(resources_.memory_used_bytes.load()) + "\n\n";
-
-        output += "# HELP apollo_gpu_usage_available Whether GPU utilization sampling is available on this system\n";
-        output += "# TYPE apollo_gpu_usage_available gauge\n";
-        output += "apollo_gpu_usage_available " + std::to_string(resources_.gpu_usage_available.load() ? 1 : 0) + "\n\n";
-
-        output += "# HELP apollo_gpu_usage_percent GPU usage percentage\n";
-        output += "# TYPE apollo_gpu_usage_percent gauge\n";
-        output += "apollo_gpu_usage_percent " + std::to_string(resources_.gpu_usage_percent.load()) + "\n\n";
-
-        output += "# HELP apollo_gpu_memory_available Whether GPU memory sampling is available on this system\n";
-        output += "# TYPE apollo_gpu_memory_available gauge\n";
-        output += "apollo_gpu_memory_available " + std::to_string(resources_.gpu_memory_available.load() ? 1 : 0) + "\n\n";
-
-        output += "# HELP apollo_gpu_memory_used_bytes GPU memory used in bytes\n";
-        output += "# TYPE apollo_gpu_memory_used_bytes gauge\n";
-        output += "apollo_gpu_memory_used_bytes " + std::to_string(resources_.gpu_memory_used_bytes.load()) + "\n\n";
-        
-        return output;
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(buffer)) {
+            return "# apollo metrics output truncated\n";
+        }
+        return std::string(buffer, static_cast<size_t>(written));
     }
     
 private:

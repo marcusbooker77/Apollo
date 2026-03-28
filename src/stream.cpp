@@ -4,6 +4,7 @@
  */
 
 // standard includes
+#include <cstring>
 #include <fstream>
 #include <future>
 #include <queue>
@@ -993,7 +994,10 @@ namespace stream {
     auto elements = data_size / slice_size + (pad ? 1 : 0);
 
     result.resize(elements * insert_size + data_size);
-    std::fill(result.begin(), result.end(), 0);
+    // Zero only the insert headers (packet headers), not the payload data which is overwritten below
+    for (auto x = 0; x < elements; ++x) {
+      std::memset(&result[x * (insert_size + slice_size)], 0, insert_size);
+    }
 
     auto next = std::begin(data1);
     auto end = std::end(data1);

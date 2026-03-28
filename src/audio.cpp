@@ -219,10 +219,11 @@ namespace audio {
 
     int samples_per_frame = frame_size * stream.channelCount;
 
-    while (!shutdown_event->peek()) {
-      std::vector<float> sample_buffer;
-      sample_buffer.resize(samples_per_frame);
+    // Pre-allocate capture buffer; after move into queue, resize reuses
+    // the retained capacity rather than reallocating each frame (~50x/sec).
+    std::vector<float> sample_buffer(samples_per_frame);
 
+    while (!shutdown_event->peek()) {
       auto status = mic->sample(sample_buffer);
       switch (status) {
         case platf::capture_e::ok:
@@ -247,6 +248,7 @@ namespace audio {
       }
 
       samples->raise(std::move(sample_buffer));
+      sample_buffer.resize(samples_per_frame);
     }
   }
 
