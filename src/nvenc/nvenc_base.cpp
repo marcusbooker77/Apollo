@@ -6,6 +6,7 @@
 #include "nvenc_base.h"
 
 // standard includes
+#include <cmath>
 #include <format>
 
 // local includes
@@ -620,8 +621,13 @@ namespace nvenc {
     NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
     reconfigure_params.reInitEncodeParams = reconfigure_state.init_params;
     reconfigure_params.reInitEncodeParams.encodeConfig = &reconfigure_state.config;
-    reconfigure_params.resetEncoder = 1;
-    reconfigure_params.forceIDR = 1;
+
+    // Only force encoder reset + IDR on large bitrate changes (>20%) to avoid
+    // unnecessary visual glitches. NVENC supports CBR reconfiguration without reset.
+    const double change_ratio = std::abs(static_cast<double>(bitrate_kbps) - reconfigure_state.bitrate_kbps) /
+                                static_cast<double>(reconfigure_state.bitrate_kbps);
+    reconfigure_params.resetEncoder = change_ratio > 0.2 ? 1 : 0;
+    reconfigure_params.forceIDR = change_ratio > 0.2 ? 1 : 0;
 
     if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
       BOOST_LOG(error) << "NvEnc: NvEncReconfigureEncoder() failed: " << last_nvenc_error_string;

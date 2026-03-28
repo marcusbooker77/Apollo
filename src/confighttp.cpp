@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <thread>
@@ -64,6 +65,7 @@ namespace confighttp {
   };
 
   // SESSION COOKIE
+  std::mutex session_mutex;
   std::string sessionCookie;
   static std::chrono::time_point<std::chrono::steady_clock> cookie_creation_time;
 
@@ -197,20 +199,23 @@ namespace confighttp {
         send_unauthorized(response, request);
       }
     });
-    if (sessionCookie.empty())
-      return false;
-    // Check for expiry
-    if (std::chrono::steady_clock::now() - cookie_creation_time > SESSION_EXPIRE_DURATION) {
-      sessionCookie.clear();
-      return false;
+    {
+      std::lock_guard<std::mutex> lock(session_mutex);
+      if (sessionCookie.empty())
+        return false;
+      // Check for expiry
+      if (std::chrono::steady_clock::now() - cookie_creation_time > SESSION_EXPIRE_DURATION) {
+        sessionCookie.clear();
+        return false;
+      }
+      auto cookies = request->header.find("cookie");
+      if (cookies == request->header.end())
+        return false;
+      auto authCookie = getCookieValue(cookies->second, "auth");
+      if (authCookie.empty() ||
+          util::hex(crypto::hash(authCookie + config::sunshine.salt)).to_string() != sessionCookie)
+        return false;
     }
-    auto cookies = request->header.find("cookie");
-    if (cookies == request->header.end())
-      return false;
-    auto authCookie = getCookieValue(cookies->second, "auth");
-    if (authCookie.empty() ||
-        util::hex(crypto::hash(authCookie + config::sunshine.salt)).to_string() != sessionCookie)
-      return false;
     fg.disable();
     return true;
   }
@@ -285,8 +290,6 @@ namespace confighttp {
       bad_request(response, request, "Content type mismatch");
       return false;
     }
-    return true;
-
     return true;
   }
 
@@ -539,7 +542,7 @@ namespace confighttp {
    * @return True if the path is a child of the base path, false otherwise.
    */
   bool isChildPath(fs::path const &base, fs::path const &query) {
-    auto relPath = fs::relative(base, query);
+    auto relPath = fs::relative(query, base);
     return *(relPath.begin()) != fs::path("..");
   }
 
@@ -551,6 +554,8 @@ namespace confighttp {
   void getNodeModules(resp_https_t response, req_https_t request) {
     print_req(request);
 
+    if (!checkIPOrigin(response, request)) return;
+
     fs::path webDirPath(WEB_DIR);
     fs::path nodeModulesPath(webDirPath / "assets");
 
@@ -558,7 +563,7 @@ namespace confighttp {
     auto filePath = fs::weakly_canonical(webDirPath / fs::path(request->path).relative_path());
 
     // Don't do anything if file does not exist or is outside the assets directory
-    if (!isChildPath(filePath, nodeModulesPath)) {
+    if (!isChildPath(nodeModulesPath, filePath)) {
       BOOST_LOG(warning) << "Someone requested a path " << filePath << " that is outside the assets folder";
       bad_request(response, request);
       return;
@@ -1574,8 +1579,11 @@ namespace confighttp {
       if (!boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password)
         return;
       std::string sessionCookieRaw = crypto::rand_alphabet(64);
-      sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
-      cookie_creation_time = std::chrono::steady_clock::now();
+      {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
+        cookie_creation_time = std::chrono::steady_clock::now();
+      }
       const SimpleWeb::CaseInsensitiveMultimap headers {
         { "Set-Cookie", "auth=" + sessionCookieRaw + "; Secure; SameSite=Strict; Max-Age=2592000; Path=/" }
       };

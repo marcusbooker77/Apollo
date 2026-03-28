@@ -90,14 +90,14 @@ public:
         }
 
         const double mean_val = sum_ / static_cast<double>(count_);
-        const double variance_val = count_ > 1 ? (sum_squares_ / static_cast<double>(count_)) - (mean_val * mean_val) : 0.0;
+        const double variance_val = count_ > 1 ? std::max(0.0, (sum_squares_ / static_cast<double>(count_)) - (mean_val * mean_val)) : 0.0;
         return {
             count_,
             sum_,
             min_,
             max_,
             variance_val,
-            std::sqrt(std::max(0.0, variance_val)),
+            std::sqrt(variance_val),
         };
     }
     
@@ -406,7 +406,7 @@ public:
         const auto packets_retransmitted = network_.packets_retransmitted.load();
         
         char buffer[4864];
-        snprintf(buffer, sizeof(buffer),
+        int written = snprintf(buffer, sizeof(buffer),
             "{\n"
             "  \"uptime_seconds\": %.2f,\n"
             "  \"sessions\": {\n"
@@ -497,7 +497,10 @@ public:
             resources_.gpu_memory_used_bytes.load() / (1024.0 * 1024.0)
         );
         
-        return std::string(buffer);
+        if (written < 0 || static_cast<size_t>(written) >= sizeof(buffer)) {
+            return "{\"error\": \"metrics output truncated\"}";
+        }
+        return std::string(buffer, static_cast<size_t>(written));
     }
     
     /**
@@ -595,8 +598,10 @@ private:
 };
 
 // Convenience macros for timing
+#define PERF_TIMER_CONCAT_(a, b) a##b
+#define PERF_TIMER_CONCAT(a, b) PERF_TIMER_CONCAT_(a, b)
 #define PERF_TIMER(stats_var) \
-    perf::scoped_timer_t PERF_TIMER_##__LINE__(stats_var)
+    perf::scoped_timer_t PERF_TIMER_CONCAT(perf_timer_, __LINE__)(stats_var)
 
 }  // namespace perf
 
