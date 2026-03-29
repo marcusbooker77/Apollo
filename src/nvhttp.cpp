@@ -8,11 +8,12 @@
 // standard includes
 #include <filesystem>
 #include <format>
+#include <mutex>
 #include <string>
 #include <utility>
-#include <string>
 
 // lib includes
+#include <openssl/crypto.h>
 #include <boost/asio/ssl/context.hpp>
 #include <boost/asio/ssl/context_base.hpp>
 #include <boost/property_tree/json_parser.hpp>
@@ -64,6 +65,9 @@ namespace nvhttp {
   static std::string otp_passphrase;
   static std::string otp_device_name;
   static std::chrono::time_point<std::chrono::steady_clock> otp_creation_time;
+  static std::mutex pairing_mutex;
+  static int otp_fail_count = 0;
+  static constexpr int MAX_OTP_ATTEMPTS = 3;
 
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
   public:
@@ -612,7 +616,8 @@ namespace nvhttp {
     auto hash = crypto::hash(data);
 
     // if hash not correct, probably MITM
-    bool same_hash = hash.size() == sess.clienthash.size() && std::equal(hash.begin(), hash.end(), sess.clienthash.begin());
+    bool same_hash = hash.size() == sess.clienthash.size() &&
+                     CRYPTO_memcmp(hash.data(), sess.clienthash.data(), hash.size()) == 0;
     auto verify = crypto::verify256(crypto::x509(client.cert), secret, sign);
     if (same_hash && verify) {
       tree.put("root.paired", 1);
@@ -757,12 +762,21 @@ namespace nvhttp {
             one_time_pin.clear();
             otp_passphrase.clear();
             otp_device_name.clear();
+            otp_fail_count = 0;
             tree.put("root.<xmlattr>.status_code", 503);
             tree.put("root.<xmlattr>.status_message", "OTP auth not available.");
+          } else if (otp_fail_count >= MAX_OTP_ATTEMPTS) {
+            one_time_pin.clear();
+            otp_passphrase.clear();
+            otp_device_name.clear();
+            otp_fail_count = 0;
+            tree.put("root.<xmlattr>.status_code", 429);
+            tree.put("root.<xmlattr>.status_message", "Too many OTP attempts. Request a new PIN.");
           } else {
             auto hash = util::hex(crypto::hash(one_time_pin + ptr->second.async_insert_pin.salt + otp_passphrase), true);
 
-            if (hash.to_string_view() == it->second) {
+            if (util::crypto_equal(hash.to_string_view(), it->second)) {
+              otp_fail_count = 0;
 
               if (!otp_device_name.empty()) {
                 ptr->second.client.name = std::move(otp_device_name);
@@ -774,6 +788,9 @@ namespace nvhttp {
               otp_passphrase.clear();
               otp_device_name.clear();
               return;
+            } else {
+              otp_fail_count++;
+              BOOST_LOG(warning) << "OTP attempt " << otp_fail_count << "/" << MAX_OTP_ATTEMPTS << " failed";
             }
           }
 
@@ -1775,7 +1792,7 @@ namespace nvhttp {
       return "";
     }
 
-    one_time_pin = crypto::rand_alphabet(4, "0123456789"sv);
+    one_time_pin = crypto::rand_alphabet(6, "0123456789"sv);
     otp_passphrase = passphrase;
     otp_device_name = deviceName;
     otp_creation_time = std::chrono::steady_clock::now();

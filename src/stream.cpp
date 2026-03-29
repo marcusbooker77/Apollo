@@ -1015,7 +1015,9 @@ namespace stream {
         const auto& cmd = config::sunshine.server_cmds[cmdIndex];
         BOOST_LOG(info) << "Executing server command: " << cmd.cmd_name;
 
-        auto exec_thread = std::thread([&cmd]{
+        auto cmd_copy = cmd;  // copy to avoid dangling reference after detach
+        auto exec_thread = std::thread([cmd_copy]{
+          const auto& cmd = cmd_copy;
           std::error_code ec;
           auto env = proc::proc.get_env();
           boost::filesystem::path working_dir = proc::find_working_directory(cmd.cmd_val, env);
@@ -1035,7 +1037,7 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_SET_CLIPBOARD], [server](session_t *session, const std::string_view &payload) {
-      BOOST_LOG(info) << "type [IDX_SET_CLIPBOARD]: "sv << payload << " size: " << payload.size();
+      BOOST_LOG(info) << "type [IDX_SET_CLIPBOARD]: size: " << payload.size();
 
       if (!(session->permission & crypto::PERM::clipboard_set)) {
         BOOST_LOG(debug) << "Permission Clipboard Set deined for [" << session->device_name << "]";

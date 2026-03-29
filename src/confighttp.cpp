@@ -64,6 +64,12 @@ namespace confighttp {
   std::string sessionCookie;
   static std::chrono::time_point<std::chrono::steady_clock> cookie_creation_time;
 
+  // LOGIN RATE LIMITING
+  static constexpr int MAX_LOGIN_ATTEMPTS = 5;
+  static constexpr auto LOGIN_LOCKOUT_DURATION = 5min;
+  static int login_fail_count = 0;
+  static std::chrono::time_point<std::chrono::steady_clock> login_lockout_until;
+
   /**
    * @brief Log the request details.
    * @param request The HTTP request object.
@@ -206,7 +212,7 @@ namespace confighttp {
       return false;
     auto authCookie = getCookieValue(cookies->second, "auth");
     if (authCookie.empty() ||
-        util::hex(crypto::hash(authCookie + config::sunshine.salt)).to_string() != sessionCookie)
+        !util::crypto_equal(util::hex(crypto::hash(authCookie + config::sunshine.salt)).to_string(), sessionCookie))
       return false;
     fg.disable();
     return true;
@@ -282,8 +288,6 @@ namespace confighttp {
       bad_request(response, request, "Content type mismatch");
       return false;
     }
-    return true;
-
     return true;
   }
 
@@ -515,9 +519,15 @@ namespace confighttp {
    * @param query The path to check.
    * @return True if the path is a child of the base path, false otherwise.
    */
-  bool isChildPath(fs::path const &base, fs::path const &query) {
-    auto relPath = fs::relative(base, query);
-    return *(relPath.begin()) != fs::path("..");
+  bool isChildPath(fs::path const &child, fs::path const &parent) {
+    auto canonical_child = fs::weakly_canonical(child).string();
+    auto canonical_parent = fs::weakly_canonical(parent).string();
+    // Ensure parent ends with separator for prefix match
+    if (!canonical_parent.empty() && canonical_parent.back() != fs::path::preferred_separator) {
+      canonical_parent += fs::path::preferred_separator;
+    }
+    return canonical_child.size() >= canonical_parent.size() &&
+           canonical_child.compare(0, canonical_parent.size(), canonical_parent) == 0;
   }
 
   /**
@@ -636,10 +646,23 @@ namespace confighttp {
 
     BOOST_LOG(info) << config::stream.file_apps;
     try {
-      // TODO: Input Validation
-
       // Read the input JSON from the request body.
       nlohmann::json inputTree = nlohmann::json::parse(ss.str());
+
+      // Input validation: require name field, reject command injection characters in paths
+      if (!inputTree.contains("name") || !inputTree["name"].is_string() || inputTree["name"].get<std::string>().empty()) {
+        bad_request(response, request, "App must have a non-empty 'name' field");
+        return;
+      }
+      for (const auto &field : {"cmd", "detached", "working-dir"}) {
+        if (inputTree.contains(field) && inputTree[field].is_string()) {
+          auto val = inputTree[field].get<std::string>();
+          if (val.find("..") != std::string::npos) {
+            bad_request(response, request, "Path traversal not allowed in app definition");
+            return;
+          }
+        }
+      }
 
       // Read the existing apps file.
       std::string content = file_handler::read_file(config::stream.file_apps.c_str());
@@ -1056,12 +1079,20 @@ namespace confighttp {
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
-      // TODO: Input Validation
+      // Input validation: reject keys that could override security-critical settings
+      static const std::set<std::string> blocked_keys = {
+        "credentials_file", "pkey", "cert", "origin_web_ui_allowed",
+        "external_ip", "log_path"
+      };
       std::stringstream config_stream;
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
       for (const auto &[k, v] : input_tree.items()) {
         if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
+          continue;
+        }
+        if (blocked_keys.count(k)) {
+          BOOST_LOG(warning) << "Blocked attempt to set security-critical config key: " << k;
           continue;
         }
 
@@ -1194,7 +1225,7 @@ namespace confighttp {
       } else {
         auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
         if (config::sunshine.username.empty() ||
-            (boost::iequals(username, config::sunshine.username) && hash == config::sunshine.password)) {
+            (username == config::sunshine.username && util::crypto_equal(hash, config::sunshine.password))) {
           if (newPassword.empty() || newPassword != confirmPassword)
             errors.push_back("Password Mismatch");
           else {
@@ -1471,7 +1502,18 @@ namespace confighttp {
       return;
     }
 
+    // Rate limiting
+    if (login_fail_count >= MAX_LOGIN_ATTEMPTS && std::chrono::steady_clock::now() < login_lockout_until) {
+      response->write(SimpleWeb::StatusCode::client_error_too_many_requests);
+      return;
+    }
+
     auto fg = util::fail_guard([&]{
+      login_fail_count++;
+      if (login_fail_count >= MAX_LOGIN_ATTEMPTS) {
+        login_lockout_until = std::chrono::steady_clock::now() + LOGIN_LOCKOUT_DURATION;
+        BOOST_LOG(warning) << "Login locked out for 5 minutes after " << login_fail_count << " failed attempts";
+      }
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
     });
 
@@ -1482,13 +1524,14 @@ namespace confighttp {
       std::string username = input_tree.value("username", "");
       std::string password = input_tree.value("password", "");
       std::string hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
-      if (!boost::iequals(username, config::sunshine.username) || hash != config::sunshine.password)
+      if (username != config::sunshine.username || !util::crypto_equal(hash, config::sunshine.password))
         return;
+      login_fail_count = 0;  // reset on success
       std::string sessionCookieRaw = crypto::rand_alphabet(64);
       sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
       cookie_creation_time = std::chrono::steady_clock::now();
       const SimpleWeb::CaseInsensitiveMultimap headers {
-        { "Set-Cookie", "auth=" + sessionCookieRaw + "; Secure; SameSite=Strict; Max-Age=2592000; Path=/" }
+        { "Set-Cookie", "auth=" + sessionCookieRaw + "; Secure; HttpOnly; SameSite=Strict; Max-Age=86400; Path=/" }
       };
       response->write(headers);
       fg.disable();

@@ -18,6 +18,7 @@
 #include <vector>
 
 #include <nlohmann/json.hpp>
+#include <openssl/crypto.h>
 
 #define KITTY_WHILE_LOOP(x, y, z) \
   { \
@@ -1092,4 +1093,14 @@ namespace util {
       return endian_helper<T>::big(x);
     }
   }  // namespace endian
+
+  /**
+   * @brief Constant-time string comparison to prevent timing side-channel attacks.
+   * Uses OpenSSL's CRYPTO_memcmp under the hood.
+   */
+  inline bool crypto_equal(const std::string_view &a, const std::string_view &b) {
+    if (a.size() != b.size()) return false;
+    // CRYPTO_memcmp is defined in <openssl/crypto.h>
+    return CRYPTO_memcmp(a.data(), b.data(), a.size()) == 0;
+  }
 }  // namespace util

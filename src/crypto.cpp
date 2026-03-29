@@ -8,6 +8,7 @@
 
 // local includes
 #include "crypto.h"
+#include "logging.h"
 
 namespace crypto {
   using asn1_string_t = util::safe_ptr<ASN1_STRING, ASN1_STRING_free>;
@@ -152,7 +153,7 @@ namespace crypto {
       // Calling with cipher == nullptr results in a parameter change
       // without requiring a reallocation of the internal cipher ctx.
       if (EVP_DecryptInit_ex(decrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
-        return false;
+        return -1;
       }
 
       auto cipher = tagged_cipher.substr(tag_size);
@@ -286,7 +287,7 @@ namespace crypto {
       // Calling with cipher == nullptr results in a parameter change
       // without requiring a reallocation of the internal cipher ctx.
       if (EVP_EncryptInit_ex(encrypt_ctx.get(), nullptr, nullptr, nullptr, iv->data()) != 1) {
-        return false;
+        return -1;
       }
 
       int update_outlen, final_outlen;
@@ -335,7 +336,10 @@ namespace crypto {
 
   sha256_t hash(const std::string_view &plaintext) {
     sha256_t hsh;
-    EVP_Digest(plaintext.data(), plaintext.size(), hsh.data(), nullptr, EVP_sha256(), nullptr);
+    if (EVP_Digest(plaintext.data(), plaintext.size(), hsh.data(), nullptr, EVP_sha256(), nullptr) != 1) {
+      BOOST_LOG(error) << "EVP_Digest failed";
+      hsh.fill(0);
+    }
     return hsh;
   }
 
@@ -394,7 +398,9 @@ namespace crypto {
     std::string r;
     r.resize(bytes);
 
-    RAND_bytes((uint8_t *) r.data(), r.size());
+    if (RAND_bytes((uint8_t *) r.data(), r.size()) != 1) {
+      BOOST_LOG(error) << "RAND_bytes failed — random data may be insufficient";
+    }
 
     return r;
   }
@@ -440,7 +446,7 @@ namespace crypto {
     BN_set_negative(serial.get(), 0);  // Serial numbers must be positive
     BN_to_ASN1_INTEGER(serial.get(), X509_get_serialNumber(x509.get()));
 
-    constexpr auto year = 60 * 60 * 24 * 365;
+    constexpr long year = 60L * 60 * 24 * 365;
 #if OPENSSL_VERSION_NUMBER < 0x10100000L
     X509_gmtime_adj(X509_get_notBefore(x509.get()), 0);
     X509_gmtime_adj(X509_get_notAfter(x509.get()), 20 * year);
@@ -499,12 +505,21 @@ namespace crypto {
   }
 
   std::string rand_alphabet(std::size_t bytes, const std::string_view &alphabet) {
-    auto value = rand(bytes);
+    auto len = alphabet.length();
+    auto limit = (256 / len) * len;  // rejection threshold to avoid modulo bias
+    std::string result;
+    result.reserve(bytes);
 
-    for (std::size_t i = 0; i != value.size(); ++i) {
-      value[i] = alphabet[value[i] % alphabet.length()];
+    while (result.size() < bytes) {
+      auto raw = rand(bytes - result.size() + 16);  // over-request to reduce iterations
+      for (std::size_t i = 0; i < raw.size() && result.size() < bytes; ++i) {
+        auto b = static_cast<uint8_t>(raw[i]);
+        if (b < limit) {
+          result.push_back(alphabet[b % len]);
+        }
+      }
     }
-    return value;
+    return result;
   }
 
 }  // namespace crypto

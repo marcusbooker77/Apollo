@@ -153,8 +153,22 @@ namespace http {
       return -1;
     }
 
-    if (file_handler::write_file(pkey.c_str(), creds.pkey)) {
+    // Write private key to a temp file, set permissions, then rename to avoid TOCTOU
+    auto pkey_tmp = pkey + ".tmp";
+    if (file_handler::write_file(pkey_tmp.c_str(), creds.pkey)) {
       BOOST_LOG(error) << "Couldn't open ["sv << config::nvhttp.pkey << ']';
+      return -1;
+    }
+    fs::permissions(pkey_tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, err_code);
+    if (err_code) {
+      BOOST_LOG(error) << "Couldn't set permissions on temp pkey: "sv << err_code.message();
+      fs::remove(pkey_tmp, err_code);
+      return -1;
+    }
+    fs::rename(pkey_tmp, pkey_path, err_code);
+    if (err_code) {
+      BOOST_LOG(error) << "Couldn't rename temp pkey: "sv << err_code.message();
+      fs::remove(pkey_tmp, err_code);
       return -1;
     }
 
@@ -163,6 +177,7 @@ namespace http {
       return -1;
     }
 
+    // pkey permissions already set above via temp file
     fs::permissions(pkey_path, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, err_code);
 
     if (err_code) {
@@ -201,11 +216,10 @@ namespace http {
       return false;
     }
 
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, ssl_version);  // NOSONAR
+    curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
     curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fwrite);
     curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);
 #ifdef _WIN32
     curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
 #endif

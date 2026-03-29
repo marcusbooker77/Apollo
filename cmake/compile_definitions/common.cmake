@@ -1,7 +1,11 @@
 # common compile definitions
 # this file will also load platform specific definitions
 
-list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
+if(MSVC)
+    list(APPEND SUNSHINE_COMPILE_OPTIONS /W3)
+else()
+    list(APPEND SUNSHINE_COMPILE_OPTIONS -Wall -Wno-sign-compare)
+endif()
 # Wall - enable all warnings
 # Werror - treat warnings as errors
 # Wno-maybe-uninitialized/Wno-uninitialized - disable warnings for maybe uninitialized variables
