@@ -314,12 +314,13 @@ namespace video {
 
   class avcodec_encode_session_t: public encode_session_t {
   public:
-    avcodec_encode_session_t() = default;
+    avcodec_encode_session_t() { encoder_type = encoder_type_e::AVCODEC; }
 
     avcodec_encode_session_t(avcodec_ctx_t &&avcodec_ctx, std::unique_ptr<platf::avcodec_encode_device_t> encode_device, int inject):
         avcodec_ctx {std::move(avcodec_ctx)},
         device {std::move(encode_device)},
         inject {inject} {
+      encoder_type = encoder_type_e::AVCODEC;
     }
 
     avcodec_encode_session_t(avcodec_encode_session_t &&other) noexcept = default;
@@ -393,6 +394,7 @@ namespace video {
   public:
     nvenc_encode_session_t(std::unique_ptr<platf::nvenc_encode_device_t> encode_device):
         device(std::move(encode_device)) {
+      encoder_type = encoder_type_e::NVENC;
     }
 
     int convert(platf::img_t &img) override {
@@ -1499,10 +1501,11 @@ namespace video {
   }
 
   int encode(int64_t frame_nr, encode_session_t &session, safe::mail_raw_t::queue_t<packet_t> &packets, void *channel_data, std::optional<std::chrono::steady_clock::time_point> frame_timestamp) {
-    if (auto avcodec_session = dynamic_cast<avcodec_encode_session_t *>(&session)) {
-      return encode_avcodec(frame_nr, *avcodec_session, packets, channel_data, frame_timestamp);
-    } else if (auto nvenc_session = dynamic_cast<nvenc_encode_session_t *>(&session)) {
-      return encode_nvenc(frame_nr, *nvenc_session, packets, channel_data, frame_timestamp);
+    switch (session.encoder_type) {
+    case encoder_type_e::AVCODEC:
+      return encode_avcodec(frame_nr, static_cast<avcodec_encode_session_t &>(session), packets, channel_data, frame_timestamp);
+    case encoder_type_e::NVENC:
+      return encode_nvenc(frame_nr, static_cast<nvenc_encode_session_t &>(session), packets, channel_data, frame_timestamp);
     }
 
     return -1;

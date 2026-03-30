@@ -1603,10 +1603,21 @@ namespace confighttp {
     // Per-IP rate limiting
     {
       std::lock_guard<std::mutex> lock(session_mutex);
+
+      // Prune expired entries to prevent unbounded growth
+      auto now = std::chrono::steady_clock::now();
+      for (auto it = login_attempts_by_ip.begin(); it != login_attempts_by_ip.end();) {
+        if (now >= it->second.second + LOGIN_LOCKOUT_DURATION) {
+          it = login_attempts_by_ip.erase(it);
+        } else {
+          ++it;
+        }
+      }
+
       auto it = login_attempts_by_ip.find(address);
       if (it != login_attempts_by_ip.end()) {
         auto &[fail_count, lockout_until] = it->second;
-        if (fail_count >= MAX_LOGIN_ATTEMPTS && std::chrono::steady_clock::now() < lockout_until) {
+        if (fail_count >= MAX_LOGIN_ATTEMPTS && now < lockout_until) {
           response->write(SimpleWeb::StatusCode::client_error_too_many_requests);
           return;
         }

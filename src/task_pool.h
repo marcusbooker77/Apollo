@@ -250,6 +250,36 @@ namespace task_pool_util {
       return std::get<0>(_timer_tasks.back());
     }
 
+  protected:
+    // Unlocked variants for use by ThreadPool under a single lock acquisition
+    std::optional<__task> _pop_unlocked() {
+      if (!_tasks.empty()) {
+        __task task = std::move(_tasks.front());
+        _tasks.pop_front();
+        return task;
+      }
+
+      if (!_timer_tasks.empty() && std::get<0>(_timer_tasks.back()) <= std::chrono::steady_clock::now()) {
+        __task task = std::move(std::get<1>(_timer_tasks.back()));
+        _timer_tasks.pop_back();
+        return task;
+      }
+
+      return std::nullopt;
+    }
+
+    bool _ready_unlocked() {
+      return !_tasks.empty() || (!_timer_tasks.empty() && std::get<0>(_timer_tasks.back()) <= std::chrono::steady_clock::now());
+    }
+
+    std::optional<__time_point> _next_unlocked() {
+      if (_timer_tasks.empty()) {
+        return std::nullopt;
+      }
+
+      return std::get<0>(_timer_tasks.back());
+    }
+
   private:
     template<class Function>
     std::unique_ptr<_ImplBase> toRunnable(Function &&f) {

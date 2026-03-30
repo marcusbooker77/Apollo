@@ -266,7 +266,7 @@ namespace stream {
 
   static inline void while_starting_do_nothing(std::atomic<session::state_e> &state) {
     while (state.load(std::memory_order_acquire) == session::state_e::STARTING) {
-      std::this_thread::sleep_for(1ms);
+      std::this_thread::sleep_for(100us);
     }
   }
 
@@ -710,9 +710,18 @@ namespace stream {
         }
 
         // packets = parity_shards + data_shards
-        rs_t rs {reed_solomon_new(data_shards, parity_shards)};
+        // Cache the last RS codec to avoid recreation when parameters match
+        thread_local size_t cached_data_shards = 0;
+        thread_local size_t cached_parity_shards = 0;
+        thread_local rs_t cached_rs {nullptr};
 
-        reed_solomon_encode(rs.get(), shards_p.begin(), nr_shards, blocksize);
+        if (cached_data_shards != data_shards || cached_parity_shards != parity_shards) {
+          cached_rs.reset(reed_solomon_new(data_shards, parity_shards));
+          cached_data_shards = data_shards;
+          cached_parity_shards = parity_shards;
+        }
+
+        reed_solomon_encode(cached_rs.get(), shards_p.begin(), nr_shards, blocksize);
       }
 
       return {
@@ -736,13 +745,13 @@ namespace stream {
    * @param data1 The first data buffer.
    * @param data2 The second data buffer.
    */
-  std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
+  void concat_and_insert(std::vector<uint8_t> &result, uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
     auto data_size = data1.size() + data2.size();
     auto pad = data_size % slice_size != 0;
     auto elements = data_size / slice_size + (pad ? 1 : 0);
 
-    std::vector<uint8_t> result;
-    result.resize(elements * insert_size + data_size);
+    auto required_size = elements * insert_size + data_size;
+    result.resize(required_size);
 
     auto next = std::begin(data1);
     auto end = std::end(data1);
@@ -770,7 +779,11 @@ namespace stream {
         next += slice_size;
       }
     }
+  }
 
+  std::vector<uint8_t> concat_and_insert(uint64_t insert_size, uint64_t slice_size, const std::string_view &data1, const std::string_view &data2) {
+    std::vector<uint8_t> result;
+    concat_and_insert(result, insert_size, slice_size, data1, data2);
     return result;
   }
 
@@ -1162,6 +1175,10 @@ namespace stream {
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
 
+      // Collect sessions needing I/O outside the lock to avoid holding mutex during network I/O
+      std::vector<session_t *> sessions_with_feedback;
+      std::vector<session_t *> sessions_with_hdr;
+
       {
         auto lg = server->_sessions.lock();
 
@@ -1203,23 +1220,32 @@ namespace stream {
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
-            auto &feedback_queue = session->control.feedback_queue;
-            while (feedback_queue->peek()) {
-              auto feedback_msg = feedback_queue->pop();
-
-              send_feedback_msg(session, *feedback_msg);
+            if (session->control.feedback_queue->peek()) {
+              sessions_with_feedback.push_back(session);
             }
-
-            auto &hdr_queue = session->control.hdr_queue;
-            while (session->control.peer && hdr_queue->peek()) {
-              auto hdr_info = hdr_queue->pop();
-
-              send_hdr_mode(session, std::move(hdr_info));
+            if (session->control.hdr_queue->peek()) {
+              sessions_with_hdr.push_back(session);
             }
           }
 
           ++pos;
         })
+      }
+
+      // Process network I/O outside the critical section
+      for (auto &session : sessions_with_feedback) {
+        auto &feedback_queue = session->control.feedback_queue;
+        while (feedback_queue->peek()) {
+          auto feedback_msg = feedback_queue->pop();
+          send_feedback_msg(session, *feedback_msg);
+        }
+      }
+      for (auto &session : sessions_with_hdr) {
+        auto &hdr_queue = session->control.hdr_queue;
+        while (session->control.peer && hdr_queue->peek()) {
+          auto hdr_info = hdr_queue->pop();
+          send_hdr_mode(session, std::move(hdr_info));
+        }
       }
 
       // Don't break until any pending sessions either expire or connect
@@ -1228,7 +1254,7 @@ namespace stream {
         break;
       }
 
-      server->iterate(150ms);
+      server->iterate(5ms);
     }
 
     // Let all remaining connections know the server is shutting down
@@ -1380,6 +1406,7 @@ namespace stream {
     }
 
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
+    std::vector<uint8_t> payload_new;
 
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
@@ -1436,7 +1463,7 @@ namespace stream {
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
       auto payload_blocksize = blocksize - sizeof(video_packet_raw_t);
-      auto payload_new = concat_and_insert(sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
+      concat_and_insert(payload_new, sizeof(video_packet_raw_t), payload_blocksize, std::string_view {(char *) &frame_header, sizeof(frame_header)}, payload);
 
       payload = std::string_view {(char *) payload_new.data(), payload_new.size()};
 
@@ -1827,6 +1854,13 @@ namespace stream {
       return -1;
     }
 
+    // Set audio socket send buffer size (SO_SENDBUF) to 256KB
+    try {
+      ctx.audio_sock.set_option(boost::asio::socket_base::send_buffer_size(256 * 1024));
+    } catch (...) {
+      BOOST_LOG(error) << "Failed to set audio socket send buffer size (SO_SENDBUF)";
+    }
+
     ctx.audio_sock.bind(udp::endpoint(protocol, audio_port), ec);
     if (ec) {
       BOOST_LOG(fatal) << "Couldn't bind Audio server to port ["sv << audio_port << "]: "sv << ec.message();
@@ -2202,6 +2236,9 @@ namespace stream {
         launch_session.gcm_key,
         false
       };
+
+      // Pre-allocate IV vector to avoid repeated allocations in the control message hot path
+      session->control.outgoing_iv.reserve(16);
 
       session->video.idr_events = mail->event<bool>(mail::idr);
       session->video.invalidate_ref_frames_events = mail->event<std::pair<int64_t, int64_t>>(mail::invalidate_ref_frames);

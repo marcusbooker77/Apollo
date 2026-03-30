@@ -81,6 +81,10 @@ namespace nvhttp {
       context.set_options(boost::asio::ssl::context::no_tlsv1_1);
       context.use_certificate_chain_file(certification_file);
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
+
+      // Enable TLS session resumption for faster reconnections
+      SSL_CTX_set_session_cache_mode(context.native_handle(), SSL_SESS_CACHE_SERVER);
+      SSL_CTX_set_timeout(context.native_handle(), 300);
     }
 
     std::function<bool(std::shared_ptr<Request>, SSL*)> verify;
@@ -724,7 +728,6 @@ namespace nvhttp {
 
       pt::write_xml(data, tree);
       response->write(data.str());
-      response->close_connection_after_response = true;
     });
 
     if (!config::sunshine.enable_pairing) {
@@ -1050,7 +1053,6 @@ namespace nvhttp {
 
     pt::write_xml(data, tree);
     response->write(data.str());
-    response->close_connection_after_response = true;
   }
 
   nlohmann::json get_all_clients() {
@@ -1117,7 +1119,6 @@ namespace nvhttp {
 
       pt::write_xml(data, tree);
       response->write(data.str());
-      response->close_connection_after_response = true;
     });
 
     auto &apps = tree.add_child("root", pt::ptree {});
@@ -1198,7 +1199,6 @@ namespace nvhttp {
 
       pt::write_xml(data, tree);
       response->write(data.str());
-      response->close_connection_after_response = true;
     });
 
     auto args = request->parse_query_string();
@@ -1395,7 +1395,6 @@ namespace nvhttp {
 
       pt::write_xml(data, tree);
       response->write(data.str());
-      response->close_connection_after_response = true;
     });
 
     auto named_cert_p = get_verified_cert(request);

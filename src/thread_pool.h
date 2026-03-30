@@ -104,7 +104,18 @@ namespace thread_pool_util {
         } else {
           std::unique_lock uniq_lock(_lock);
 
-          if (ready()) {
+          // Single _task_mutex acquisition to check ready state and get next timer
+          bool is_ready;
+          std::optional<__time_point> next_tp;
+          {
+            std::lock_guard lg(this->_task_mutex);
+            is_ready = this->_ready_unlocked();
+            if (!is_ready) {
+              next_tp = this->_next_unlocked();
+            }
+          }
+
+          if (is_ready) {
             continue;
           }
 
@@ -112,8 +123,8 @@ namespace thread_pool_util {
             break;
           }
 
-          if (auto tp = next()) {
-            _cv.wait_until(uniq_lock, *tp);
+          if (next_tp) {
+            _cv.wait_until(uniq_lock, *next_tp);
           } else {
             _cv.wait(uniq_lock);
           }

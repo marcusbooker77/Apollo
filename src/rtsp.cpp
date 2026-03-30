@@ -456,6 +456,13 @@ namespace rtsp_stream {
 
       auto socket = std::move(next_socket);
 
+      // Disable Nagle's algorithm for low-latency RTSP communication
+      boost::system::error_code nodelay_ec;
+      socket->sock.set_option(tcp::no_delay(true), nodelay_ec);
+      if (nodelay_ec) {
+        BOOST_LOG(warning) << "Failed to set TCP_NODELAY on RTSP socket: "sv << nodelay_ec.message();
+      }
+
       auto launch_session {launch_event.view(0s)};
       if (launch_session) {
         // Associate the current RTSP session with this socket and start reading
