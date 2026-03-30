@@ -46,16 +46,20 @@ namespace uuid_util {
         throw std::invalid_argument("Invalid UUID string length");
       }
 
-      uuid_t uuid;
+      uuid_t uuid {};
       unsigned int temp16_1;
       unsigned int temp32_1, temp32_2;
 
       // Parse UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
       unsigned int data1, data2;
-      std::sscanf(
+      int fields = std::sscanf(
         uuid_str.c_str(), "%8x-%4x-%4x-%4x-%8x%4x",
         &uuid.b32[0], &data1, &data2, &temp16_1, &temp32_1, &temp32_2
       );
+
+      if (fields != 6) {
+        throw std::invalid_argument("Invalid UUID string format");
+      }
 
       // Assign parsed values into uuid_t structure
       uuid.b16[2] = static_cast<std::uint16_t>(data1);

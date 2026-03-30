@@ -10,11 +10,13 @@
 #include <filesystem>
 #include <format>
 #include <fstream>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <thread>
 #include <numeric>
 #include <algorithm>
+#include <unordered_map>
 
 // lib includes
 #include <boost/algorithm/string.hpp>
@@ -61,14 +63,17 @@ namespace confighttp {
   };
 
   // SESSION COOKIE
+  static std::mutex session_mutex;
   std::string sessionCookie;
   static std::chrono::time_point<std::chrono::steady_clock> cookie_creation_time;
 
-  // LOGIN RATE LIMITING
+  // CSRF TOKEN
+  static std::string csrfToken;
+
+  // LOGIN RATE LIMITING (per-IP)
   static constexpr int MAX_LOGIN_ATTEMPTS = 5;
   static constexpr auto LOGIN_LOCKOUT_DURATION = 5min;
-  static int login_fail_count = 0;
-  static std::chrono::time_point<std::chrono::steady_clock> login_lockout_until;
+  static std::unordered_map<std::string, std::pair<int, std::chrono::steady_clock::time_point>> login_attempts_by_ip;
 
   /**
    * @brief Log the request details.
@@ -200,6 +205,7 @@ namespace confighttp {
         send_unauthorized(response, request);
       }
     });
+    std::lock_guard<std::mutex> lock(session_mutex);
     if (sessionCookie.empty())
       return false;
     // Check for expiry
@@ -256,6 +262,36 @@ namespace confighttp {
     response->write(code, tree.dump(), headers);
   }
 
+
+  /**
+   * @brief Send a 403 Forbidden response.
+   */
+  void send_forbidden(resp_https_t response, req_https_t request, const std::string &error_message = "Forbidden") {
+    constexpr SimpleWeb::StatusCode code = SimpleWeb::StatusCode::client_error_forbidden;
+    nlohmann::json tree;
+    tree["status_code"] = static_cast<int>(code);
+    tree["status"] = false;
+    tree["error"] = error_message;
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Content-Type", "application/json");
+    headers.emplace("X-Frame-Options", "DENY");
+    headers.emplace("Content-Security-Policy", "frame-ancestors 'none';");
+    response->write(code, tree.dump(), headers);
+  }
+
+  /**
+   * @brief Verify CSRF token from request header.
+   * @return True if valid, false otherwise (sends 403).
+   */
+  bool verifyCsrf(resp_https_t response, req_https_t request) {
+    auto header_it = request->header.find("X-CSRF-Token");
+    std::lock_guard<std::mutex> lock(session_mutex);
+    if (csrfToken.empty() || header_it == request->header.end() || header_it->second != csrfToken) {
+      send_forbidden(response, request, "Invalid or missing CSRF token");
+      return false;
+    }
+    return true;
+  }
 
   /**
    * @brief Validate the request content type and send bad request when mismatch.
@@ -443,6 +479,10 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void getWelcomePage(resp_https_t response, req_https_t request) {
+    if (!checkIPOrigin(response, request)) {
+      return;
+    }
+
     print_req(request);
 
     if (!config::sunshine.username.empty()) {
@@ -635,7 +675,7 @@ namespace confighttp {
    * @api_examples{/api/apps| POST| {"name":"Hello, World!","uuid": "aaaa-bbbb"}}
    */
   void saveApp(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -694,7 +734,7 @@ namespace confighttp {
    * @api_examples{/api/apps/close| POST| null}
    */
   void closeApp(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -714,7 +754,7 @@ namespace confighttp {
    * @api_examples{/api/apps/reorder| POST| {"order": ["aaaa-bbbb", "cccc-dddd"]}}
    */
   void reorderApps(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -828,7 +868,7 @@ namespace confighttp {
    * @api_examples{/api/apps/delete | POST| { uuid: 'aaaa-bbbb' }}
    */
   void deleteApp(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -918,7 +958,7 @@ namespace confighttp {
    * @endcode
    */
   void updateClient(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -971,7 +1011,7 @@ namespace confighttp {
    * @api_examples{/api/clients/unpair| POST| {"uuid":"1234"}}
    */
   void unpair(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -999,7 +1039,7 @@ namespace confighttp {
    * @api_examples{/api/clients/unpair-all| POST| null}
    */
   void unpairAll(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1070,7 +1110,7 @@ namespace confighttp {
    * @api_examples{/api/config| POST| {"key":"value"}}
    */
   void saveConfig(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1079,10 +1119,27 @@ namespace confighttp {
     std::stringstream ss;
     ss << request->content.rdbuf();
     try {
-      // Input validation: reject keys that could override security-critical settings
-      static const std::set<std::string> blocked_keys = {
-        "credentials_file", "pkey", "cert", "origin_web_ui_allowed",
-        "external_ip", "log_path"
+      // Input validation: only allow known-safe configuration keys (allowlist)
+      static const std::set<std::string> allowed_keys = {
+        // UI preferences
+        "locale", "sunshine_name", "theme",
+        // Stream quality / encoder settings
+        "min_fps_factor", "min_threads", "hevc_mode", "av1_mode",
+        "encoder", "min_log_level", "fec_percentage",
+        "channels", "qp", "min_bitrate", "max_bitrate",
+        "video_format",
+        // Audio/video settings
+        "audio_sink", "virtual_sink", "install_steam_audio_drivers",
+        "adapter_name", "output_name", "resolutions", "fps",
+        // Network / UPnP
+        "upnp", "address_family", "port",
+        // Input settings
+        "back_button_timeout", "key_repeat_delay", "key_repeat_period",
+        "always_send_scancodes", "key_rightalt_to_key_win",
+        "gamepad", "ds4_back_as_touchpad_click", "motion_as_ds4",
+        "touchpad_as_ds4",
+        // Display settings
+        "notify_pre_releases",
       };
       std::stringstream config_stream;
       nlohmann::json output_tree;
@@ -1091,9 +1148,19 @@ namespace confighttp {
         if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
           continue;
         }
-        if (blocked_keys.count(k)) {
-          BOOST_LOG(warning) << "Blocked attempt to set security-critical config key: " << k;
+        if (!allowed_keys.count(k)) {
+          BOOST_LOG(warning) << "Rejected config key not in allowlist: " << k;
           continue;
+        }
+
+        // Reject values containing newline characters (config injection)
+        if (v.is_string()) {
+          auto val = v.get<std::string>();
+          if (val.find('
+') != std::string::npos || val.find('') != std::string::npos) {
+            BOOST_LOG(warning) << "Rejected config value with newline for key: " << k;
+            continue;
+          }
         }
 
         // v.dump() will dump valid json, which we do not want for strings in the config right now
@@ -1117,7 +1184,7 @@ namespace confighttp {
    * @api_examples{/api/covers/upload| POST| {"key":"igdb_1234","url":"https://images.igdb.com/igdb/image/upload/t_cover_big_2x/abc123.png"}}
    */
   void uploadCover(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1206,6 +1273,8 @@ namespace confighttp {
   void savePassword(resp_https_t response, req_https_t request) {
     if ((!config::sunshine.username.empty() && !authenticate(response, request)) || !validateContentType(response, request, "application/json"))
       return;
+    if (!config::sunshine.username.empty() && !verifyCsrf(response, request))
+      return;
     print_req(request);
     std::vector<std::string> errors;
     std::stringstream ss;
@@ -1218,12 +1287,17 @@ namespace confighttp {
       std::string password = input_tree.value("currentPassword", "");
       std::string newPassword = input_tree.value("newPassword", "");
       std::string confirmPassword = input_tree.value("confirmNewPassword", "");
+      auto cleanse_pw_creds = util::fail_guard([&]{
+        OPENSSL_cleanse(password.data(), password.size());
+        OPENSSL_cleanse(newPassword.data(), newPassword.size());
+        OPENSSL_cleanse(confirmPassword.data(), confirmPassword.size());
+      });
       if (newUsername.empty())
         newUsername = username;
       if (newUsername.empty()) {
         errors.push_back("Invalid Username");
       } else {
-        auto hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
+        auto hash = http::hash_password(password, config::sunshine.salt, config::sunshine.hash_version);
         if (config::sunshine.username.empty() ||
             (username == config::sunshine.username && util::crypto_equal(hash, config::sunshine.password))) {
           if (newPassword.empty() || newPassword != confirmPassword)
@@ -1231,7 +1305,11 @@ namespace confighttp {
           else {
             http::save_user_creds(config::sunshine.credentials_file, newUsername, newPassword);
             http::reload_user_creds(config::sunshine.credentials_file);
-            sessionCookie.clear(); // force re-login
+            {
+              std::lock_guard<std::mutex> lock(session_mutex);
+              sessionCookie.clear(); // force re-login
+              csrfToken.clear();
+            }
             output_tree["status"] = true;
           }
         } else {
@@ -1308,7 +1386,7 @@ namespace confighttp {
    * @api_examples{/api/pin| POST| {"pin":"1234","name":"My PC"}}
    */
   void savePin(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1337,7 +1415,7 @@ namespace confighttp {
    * @api_examples{/api/reset-display-device-persistence| POST| null}
    */
   void resetDisplayDevicePersistence(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1356,7 +1434,7 @@ namespace confighttp {
    * @api_examples{/api/restart| POST| null}
    */
   void restart(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1376,7 +1454,7 @@ namespace confighttp {
    * On Windows, if running in a service, a special shutdown code is returned.
    */
   void quit(resp_https_t response, req_https_t request) {
-    if (!authenticate(response, request)) {
+    if (!authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1408,7 +1486,7 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void launchApp(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1464,7 +1542,7 @@ namespace confighttp {
    * @param request The HTTP request object.
    */
   void disconnect(resp_https_t response, req_https_t request) {
-    if (!validateContentType(response, request, "application/json") || !authenticate(response, request)) {
+    if (!validateContentType(response, request, "application/json") || !authenticate(response, request) || !verifyCsrf(response, request)) {
       return;
     }
 
@@ -1485,6 +1563,25 @@ namespace confighttp {
   }
 
   /**
+   * @brief Get the CSRF token for the current session.
+   * @param response The HTTP response object.
+   * @param request The HTTP request object.
+   */
+  void getCsrfToken(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) {
+      return;
+    }
+
+    nlohmann::json output_tree;
+    {
+      std::lock_guard<std::mutex> lock(session_mutex);
+      output_tree["csrf_token"] = csrfToken;
+    }
+    output_tree["status"] = true;
+    send_response(response, output_tree);
+  }
+
+  /**
    * @brief Login the user.
    * @param response The HTTP response object.
    * @param request The HTTP request object.
@@ -1502,17 +1599,28 @@ namespace confighttp {
       return;
     }
 
-    // Rate limiting
-    if (login_fail_count >= MAX_LOGIN_ATTEMPTS && std::chrono::steady_clock::now() < login_lockout_until) {
-      response->write(SimpleWeb::StatusCode::client_error_too_many_requests);
-      return;
+    auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+
+    // Per-IP rate limiting
+    {
+      std::lock_guard<std::mutex> lock(session_mutex);
+      auto it = login_attempts_by_ip.find(address);
+      if (it != login_attempts_by_ip.end()) {
+        auto &[fail_count, lockout_until] = it->second;
+        if (fail_count >= MAX_LOGIN_ATTEMPTS && std::chrono::steady_clock::now() < lockout_until) {
+          response->write(SimpleWeb::StatusCode::client_error_too_many_requests);
+          return;
+        }
+      }
     }
 
     auto fg = util::fail_guard([&]{
-      login_fail_count++;
-      if (login_fail_count >= MAX_LOGIN_ATTEMPTS) {
-        login_lockout_until = std::chrono::steady_clock::now() + LOGIN_LOCKOUT_DURATION;
-        BOOST_LOG(warning) << "Login locked out for 5 minutes after " << login_fail_count << " failed attempts";
+      std::lock_guard<std::mutex> lock(session_mutex);
+      auto &[fail_count, lockout_until] = login_attempts_by_ip[address];
+      fail_count++;
+      if (fail_count >= MAX_LOGIN_ATTEMPTS) {
+        lockout_until = std::chrono::steady_clock::now() + LOGIN_LOCKOUT_DURATION;
+        BOOST_LOG(warning) << "Login locked out for 5 minutes for IP " << address << " after " << fail_count << " failed attempts";
       }
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
     });
@@ -1523,20 +1631,28 @@ namespace confighttp {
       nlohmann::json input_tree = nlohmann::json::parse(ss.str());
       std::string username = input_tree.value("username", "");
       std::string password = input_tree.value("password", "");
-      std::string hash = util::hex(crypto::hash(password + config::sunshine.salt)).to_string();
+      std::string hash = http::hash_password(password, config::sunshine.salt, config::sunshine.hash_version);
+      auto cleanse_login_creds = util::fail_guard([&]{
+        OPENSSL_cleanse(password.data(), password.size());
+        OPENSSL_cleanse(hash.data(), hash.size());
+      });
       if (username != config::sunshine.username || !util::crypto_equal(hash, config::sunshine.password))
         return;
-      login_fail_count = 0;  // reset on success
-      std::string sessionCookieRaw = crypto::rand_alphabet(64);
-      sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
-      cookie_creation_time = std::chrono::steady_clock::now();
-      const SimpleWeb::CaseInsensitiveMultimap headers {
-        { "Set-Cookie", "auth=" + sessionCookieRaw + "; Secure; HttpOnly; SameSite=Strict; Max-Age=86400; Path=/" }
-      };
-      response->write(headers);
+      {
+        std::lock_guard<std::mutex> lock(session_mutex);
+        login_attempts_by_ip.erase(address);  // reset on success
+        std::string sessionCookieRaw = crypto::rand_alphabet(64);
+        sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
+        cookie_creation_time = std::chrono::steady_clock::now();
+        csrfToken = crypto::rand_alphabet(32);
+        const SimpleWeb::CaseInsensitiveMultimap headers {
+          { "Set-Cookie", "auth=" + sessionCookieRaw + "; Secure; HttpOnly; SameSite=Strict; Max-Age=86400; Path=/" }
+        };
+        response->write(headers);
+      }
       fg.disable();
     } catch (std::exception &e) {
-      BOOST_LOG(warning) << "Web UI Login failed: ["sv << net::addr_to_normalized_string(request->remote_endpoint().address())
+      BOOST_LOG(warning) << "Web UI Login failed: ["sv << address
                                << "]: "sv << e.what();
       response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
       fg.disable();
@@ -1574,6 +1690,7 @@ namespace confighttp {
     server.resource["^/login/?$"]["GET"] = getLoginPage;
     server.resource["^/troubleshooting/?$"]["GET"] = getTroubleshootingPage;
     server.resource["^/api/login"]["POST"] = login;
+    server.resource["^/api/csrf-token$"]["GET"] = getCsrfToken;
     server.resource["^/api/pin$"]["POST"] = savePin;
     server.resource["^/api/otp$"]["POST"] = getOTP;
     server.resource["^/api/apps$"]["GET"] = getApps;

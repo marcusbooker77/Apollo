@@ -68,6 +68,18 @@ namespace http {
     return 0;
   }
 
+  std::string hash_password(const std::string &password, const std::string &salt, int hash_version) {
+    constexpr int HASH_ITERATIONS = 100000;
+    auto hash_result = crypto::hash(password + salt);
+    if (hash_version >= 2) {
+      for (int i = 1; i < HASH_ITERATIONS; ++i) {
+        std::string_view hash_view(reinterpret_cast<const char *>(hash_result.data()), hash_result.size());
+        hash_result = crypto::hash(hash_view);
+      }
+    }
+    return util::hex(hash_result).to_string();
+  }
+
   int save_user_creds(const std::string &file, const std::string &username, const std::string &password, bool run_our_mouth) {
     nlohmann::json outputTree;
 
@@ -82,9 +94,11 @@ namespace http {
     }
 
     auto salt = crypto::rand_alphabet(16);
+    constexpr int CURRENT_HASH_VERSION = 2;
     outputTree["username"] = username;
     outputTree["salt"] = salt;
-    outputTree["password"] = util::hex(crypto::hash(password + salt)).to_string();
+    outputTree["password"] = hash_password(password, salt, CURRENT_HASH_VERSION);
+    outputTree["hash_version"] = CURRENT_HASH_VERSION;  // v1 = single SHA-256, v2 = iterated 100k rounds
     try {
       std::ofstream out(file);
       out << outputTree.dump(4);  // Pretty-print with an indent of 4 spaces.
@@ -122,6 +136,7 @@ namespace http {
       config::sunshine.username = inputTree.get<std::string>("username");
       config::sunshine.password = inputTree.get<std::string>("password");
       config::sunshine.salt = inputTree.get<std::string>("salt");
+      config::sunshine.hash_version = inputTree.get<int>("hash_version", 1);
     } catch (std::exception &e) {
       BOOST_LOG(error) << "loading user credentials: "sv << e.what();
       return -1;
@@ -134,6 +149,9 @@ namespace http {
     fs::path cert_path = cert;
 
     auto creds = crypto::gen_creds("Sunshine Gamestream Host"sv, 2048);
+    auto cleanse_pkey = util::fail_guard([&]{
+      OPENSSL_cleanse(creds.pkey.data(), creds.pkey.size());
+    });
 
     auto pkey_dir = pkey_path;
     auto cert_dir = cert_path;
@@ -229,6 +247,10 @@ namespace http {
     }
     curl_easy_cleanup(curl);
     fclose(fp);
+    if (result != CURLE_OK) {
+      std::error_code ec;
+      fs::remove(file, ec);
+    }
     return result == CURLE_OK;
   }
 

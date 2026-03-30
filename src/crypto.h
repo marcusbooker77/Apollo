@@ -9,6 +9,7 @@
 
 // lib includes
 #include <list>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
@@ -158,6 +159,12 @@ namespace crypto {
 
     class cipher_t {
     public:
+      ~cipher_t() {
+        if (!key.empty()) {
+          OPENSSL_cleanse(key.data(), key.size());
+        }
+      }
+
       cipher_ctx_t decrypt_ctx;
       cipher_ctx_t encrypt_ctx;
 

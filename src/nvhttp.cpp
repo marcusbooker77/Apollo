@@ -6,6 +6,8 @@
 #define BOOST_BIND_GLOBAL_PLACEHOLDERS
 
 // standard includes
+#include <algorithm>
+#include <array>
 #include <filesystem>
 #include <format>
 #include <mutex>
@@ -65,7 +67,7 @@ namespace nvhttp {
   static std::string otp_passphrase;
   static std::string otp_device_name;
   static std::chrono::time_point<std::chrono::steady_clock> otp_creation_time;
-  static std::mutex pairing_mutex;
+  static std::recursive_mutex pairing_mutex;
   static int otp_fail_count = 0;
   static constexpr int MAX_OTP_ATTEMPTS = 3;
 
@@ -475,6 +477,7 @@ namespace nvhttp {
   }
 
   void remove_session(const pair_session_t &sess) {
+    std::lock_guard<std::recursive_mutex> lock(pairing_mutex);
     map_id_sess.erase(sess.client.uniqueID);
   }
 
@@ -684,8 +687,13 @@ namespace nvhttp {
 
     BOOST_LOG(debug) << " [--] "sv;
 
+    static const std::array<std::string_view, 5> redacted_params = {
+      "clientcert"sv, "salt"sv, "rikey"sv, "rikeyid"sv, "serverchallengeresp"sv
+    };
     for (auto &[name, val] : request->parse_query_string()) {
-      BOOST_LOG(debug) << name << " -- " << val;
+      bool sensitive = std::any_of(redacted_params.begin(), redacted_params.end(),
+        [&name](std::string_view p) { return name == p; });
+      BOOST_LOG(debug) << name << " -- " << (sensitive ? "[REDACTED]"sv : std::string_view(val));
     }
 
     BOOST_LOG(debug) << " [--] "sv;
@@ -751,7 +759,15 @@ namespace nvhttp {
         sess.client.name = std::move(deviceName);
         sess.client.cert = util::from_hex_vec(get_arg(args, "clientcert"), true);
 
-        BOOST_LOG(debug) << sess.client.cert;
+        BOOST_LOG(debug) << "Pairing session initiated for device: " << sess.client.name;
+        std::lock_guard<std::recursive_mutex> lock(pairing_mutex);
+
+        if (map_id_sess.size() >= 10) {
+          tree.put("root.<xmlattr>.status_code", 503);
+          tree.put("root.<xmlattr>.status_message", "Too many active pairing sessions");
+          return;
+        }
+
         auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
 
         ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
@@ -759,14 +775,18 @@ namespace nvhttp {
         auto it = args.find("otpauth");
         if (it != std::end(args)) {
           if (one_time_pin.empty() || (std::chrono::steady_clock::now() - otp_creation_time > OTP_EXPIRE_DURATION)) {
+            OPENSSL_cleanse(one_time_pin.data(), one_time_pin.size());
             one_time_pin.clear();
+            OPENSSL_cleanse(otp_passphrase.data(), otp_passphrase.size());
             otp_passphrase.clear();
             otp_device_name.clear();
             otp_fail_count = 0;
             tree.put("root.<xmlattr>.status_code", 503);
             tree.put("root.<xmlattr>.status_message", "OTP auth not available.");
           } else if (otp_fail_count >= MAX_OTP_ATTEMPTS) {
+            OPENSSL_cleanse(one_time_pin.data(), one_time_pin.size());
             one_time_pin.clear();
+            OPENSSL_cleanse(otp_passphrase.data(), otp_passphrase.size());
             otp_passphrase.clear();
             otp_device_name.clear();
             otp_fail_count = 0;
@@ -784,7 +804,9 @@ namespace nvhttp {
 
               getservercert(ptr->second, tree, one_time_pin);
 
+              OPENSSL_cleanse(one_time_pin.data(), one_time_pin.size());
               one_time_pin.clear();
+              OPENSSL_cleanse(otp_passphrase.data(), otp_passphrase.size());
               otp_passphrase.clear();
               otp_device_name.clear();
               return;
@@ -822,6 +844,7 @@ namespace nvhttp {
       }
     }
 
+    std::lock_guard<std::recursive_mutex> lock(pairing_mutex);
     auto sess_it = map_id_sess.find(uniqID);
     if (sess_it == std::end(map_id_sess)) {
       tree.put("root.<xmlattr>.status_code", 400);
@@ -847,6 +870,7 @@ namespace nvhttp {
 
   bool pin(std::string pin, std::string name) {
     pt::ptree tree;
+    std::lock_guard<std::recursive_mutex> lock(pairing_mutex);
     if (map_id_sess.empty()) {
       return false;
     }
@@ -1778,7 +1802,10 @@ namespace nvhttp {
     // Wait for any event
     shutdown_event->view();
 
-    map_id_sess.clear();
+    {
+      std::lock_guard<std::recursive_mutex> lock(pairing_mutex);
+      map_id_sess.clear();
+    }
 
     https_server.stop();
     http_server.stop();

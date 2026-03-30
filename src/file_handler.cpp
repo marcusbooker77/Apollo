@@ -51,6 +51,10 @@ namespace file_handler {
 
     out << contents;
 
+    if (out.fail()) {
+      return -1;
+    }
+
     return 0;
   }
 }  // namespace file_handler

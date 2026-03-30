@@ -593,6 +593,10 @@ namespace stream {
           {
             net::packet_t packet {event.packet};
 
+            if (packet->dataLength < sizeof(std::uint16_t)) {
+              BOOST_LOG(warning) << "Control: packet too small"sv;
+              return;
+            }
             auto type = *(std::uint16_t *) packet->data;
             std::string_view payload {(char *) packet->data + sizeof(type), packet->dataLength - sizeof(type)};
 
@@ -941,6 +945,10 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_LOSS_STATS], [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < 4 * sizeof(int32_t)) {
+        BOOST_LOG(warning) << "IDX_LOSS_STATS: payload too small"sv;
+        return;
+      }
       int32_t *stats = (int32_t *) payload.data();
       auto count = stats[0];
       std::chrono::milliseconds t {stats[1]};
@@ -963,6 +971,10 @@ namespace stream {
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
+      if (payload.size() < 2 * sizeof(std::int64_t)) {
+        BOOST_LOG(warning) << "IDX_INVALIDATE_REF_FRAMES: payload too small"sv;
+        return;
+      }
       auto frames = (std::int64_t *) payload.data();
       auto firstFrame = frames[0];
       auto lastFrame = frames[1];
@@ -978,6 +990,10 @@ namespace stream {
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_INPUT_DATA]"sv;
 
+      if (payload.size() < sizeof(int32_t)) {
+        BOOST_LOG(warning) << "IDX_INPUT_DATA: payload too small"sv;
+        return;
+      }
       auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
       std::string_view tagged_cipher {payload.data() + sizeof(tagged_cipher_length), (size_t) tagged_cipher_length};
 
@@ -1009,6 +1025,10 @@ namespace stream {
         return;
       }
 
+      if (payload.size() < 1) {
+        BOOST_LOG(warning) << "IDX_EXEC_SERVER_CMD: payload too small"sv;
+        return;
+      }
       uint8_t cmdIndex = *(uint8_t*)payload.data();
 
       if (cmdIndex < config::sunshine.server_cmds.size()) {
@@ -1057,10 +1077,18 @@ namespace stream {
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
-      auto header = (control_encrypted_p) (payload.data() - 2);
+      // payload layout (after 2-byte type stripped by caller):
+      //   [0..1] length (uint16_t LE)
+      //   [2..5] seq    (uint32_t LE)
+      //   [6.. ] encrypted data (tag + ciphertext)
+      constexpr size_t hdr_size = sizeof(std::uint16_t) + sizeof(std::uint32_t); // 6
+      if (payload.size() < hdr_size) {
+        BOOST_LOG(warning) << "Control: Encrypted packet too small for header"sv;
+        return;
+      }
 
-      auto length = util::endian::little(header->length);
-      auto seq = util::endian::little(header->seq);
+      auto length = util::endian::little(*(std::uint16_t *) payload.data());
+      auto seq = util::endian::little(*(std::uint32_t *) (payload.data() + sizeof(std::uint16_t)));
 
       if (length < (16 + 4 + 4)) {
         BOOST_LOG(warning) << "Control: Runt packet"sv;
@@ -1068,7 +1096,7 @@ namespace stream {
       }
 
       auto tagged_cipher_length = length - 4;
-      std::string_view tagged_cipher {(char *) header->payload(), (size_t) tagged_cipher_length};
+      std::string_view tagged_cipher {payload.data() + hdr_size, (size_t) tagged_cipher_length};
 
       auto &cipher = session->control.cipher;
       auto &iv = session->control.incoming_iv;
@@ -1089,7 +1117,10 @@ namespace stream {
         // Nvidia's old style encryption uses a 16-byte IV
         iv.resize(16);
 
-        iv[0] = (std::uint8_t) seq;
+        iv[0] = (std::uint8_t)(seq >> 24);
+        iv[1] = (std::uint8_t)(seq >> 16);
+        iv[2] = (std::uint8_t)(seq >> 8);
+        iv[3] = (std::uint8_t)(seq & 0xFF);
       }
 
       std::vector<uint8_t> plaintext;

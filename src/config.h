@@ -269,6 +269,7 @@ namespace config {
     std::string username;
     std::string password;
     std::string salt;
+    int hash_version = 1;  // 1 = single SHA-256, 2 = iterated (100k rounds)
 
     std::string config_file;
 

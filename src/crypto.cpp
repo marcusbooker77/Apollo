@@ -331,6 +331,9 @@ namespace crypto {
 
     std::copy(std::begin(hsh), std::begin(hsh) + key.size(), std::begin(key));
 
+    OPENSSL_cleanse(salt_pin.data(), salt_pin.size());
+    OPENSSL_cleanse(hsh.data(), hsh.size());
+
     return key;
   }
 
@@ -372,7 +375,9 @@ namespace crypto {
     BUF_MEM *mem_ptr;
     BIO_get_mem_ptr(bio.get(), &mem_ptr);
 
-    return {mem_ptr->data, mem_ptr->length};
+    std::string result {mem_ptr->data, mem_ptr->length};
+    OPENSSL_cleanse(mem_ptr->data, mem_ptr->length);
+    return result;
   }
 
   std::string pem(pkey_t &pkey) {
@@ -382,7 +387,9 @@ namespace crypto {
     BUF_MEM *mem_ptr;
     BIO_get_mem_ptr(bio.get(), &mem_ptr);
 
-    return {mem_ptr->data, mem_ptr->length};
+    std::string result {mem_ptr->data, mem_ptr->length};
+    OPENSSL_cleanse(mem_ptr->data, mem_ptr->length);
+    return result;
   }
 
   std::string_view signature(const x509_t &x) {

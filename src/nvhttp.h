@@ -101,6 +101,21 @@ namespace nvhttp {
   };
 
   struct pair_session_t {
+    ~pair_session_t() {
+      if (cipher_key) {
+        OPENSSL_cleanse(cipher_key->data(), cipher_key->size());
+      }
+      if (!clienthash.empty()) {
+        OPENSSL_cleanse(clienthash.data(), clienthash.size());
+      }
+      if (!serversecret.empty()) {
+        OPENSSL_cleanse(serversecret.data(), serversecret.size());
+      }
+      if (!serverchallenge.empty()) {
+        OPENSSL_cleanse(serverchallenge.data(), serverchallenge.size());
+      }
+    }
+
     struct {
       std::string uniqueID = {};
       std::string cert = {};
