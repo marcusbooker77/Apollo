@@ -286,7 +286,7 @@ namespace confighttp {
   bool verifyCsrf(resp_https_t response, req_https_t request) {
     auto header_it = request->header.find("X-CSRF-Token");
     std::lock_guard<std::mutex> lock(session_mutex);
-    if (csrfToken.empty() || header_it == request->header.end() || header_it->second != csrfToken) {
+    if (csrfToken.empty() || header_it == request->header.end() || !util::crypto_equal(header_it->second, csrfToken)) {
       send_forbidden(response, request, "Invalid or missing CSRF token");
       return false;
     }

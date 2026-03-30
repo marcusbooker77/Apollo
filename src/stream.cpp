@@ -1008,6 +1008,10 @@ namespace stream {
         return;
       }
       auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
+      if (tagged_cipher_length < 0 || (size_t) tagged_cipher_length > payload.size() - sizeof(int32_t)) {
+        BOOST_LOG(warning) << "IDX_INPUT_DATA: invalid cipher length"sv;
+        return;
+      }
       std::string_view tagged_cipher {payload.data() + sizeof(tagged_cipher_length), (size_t) tagged_cipher_length};
 
       std::vector<uint8_t> plaintext;
@@ -1109,6 +1113,10 @@ namespace stream {
       }
 
       auto tagged_cipher_length = length - 4;
+      if ((size_t) tagged_cipher_length > payload.size() - hdr_size) {
+        BOOST_LOG(warning) << "Control: Encrypted payload length exceeds buffer"sv;
+        return;
+      }
       std::string_view tagged_cipher {payload.data() + hdr_size, (size_t) tagged_cipher_length};
 
       auto &cipher = session->control.cipher;
