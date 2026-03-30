@@ -726,6 +726,7 @@ namespace nvhttp {
     std::ostringstream data;
 
     pt::write_xml(data, tree);
+    response->close_connection_after_response = true;
     response->write(SimpleWeb::StatusCode::client_error_not_found, data.str());
     response->close_connection_after_response = true;
   }
@@ -740,6 +741,7 @@ namespace nvhttp {
       std::ostringstream data;
 
       pt::write_xml(data, tree);
+      response->close_connection_after_response = true;
       response->write(data.str());
     });
 
@@ -1066,6 +1068,7 @@ namespace nvhttp {
     std::ostringstream data;
 
     pt::write_xml(data, tree);
+    response->close_connection_after_response = true;
     response->write(data.str());
   }
 
@@ -1132,6 +1135,7 @@ namespace nvhttp {
       std::ostringstream data;
 
       pt::write_xml(data, tree);
+      response->close_connection_after_response = true;
       response->write(data.str());
     });
 
@@ -1212,6 +1216,7 @@ namespace nvhttp {
       std::ostringstream data;
 
       pt::write_xml(data, tree);
+      response->close_connection_after_response = true;
       response->write(data.str());
     });
 
@@ -1408,6 +1413,7 @@ namespace nvhttp {
       std::ostringstream data;
 
       pt::write_xml(data, tree);
+      response->close_connection_after_response = true;
       response->write(data.str());
     });
 
@@ -1518,6 +1524,7 @@ namespace nvhttp {
       std::ostringstream data;
 
       pt::write_xml(data, tree);
+      response->close_connection_after_response = true;
       response->write(data.str());
       response->close_connection_after_response = true;
     });
@@ -1550,6 +1557,7 @@ namespace nvhttp {
     print_req<SunshineHTTPS>(request);
 
     auto fg = util::fail_guard([&]() {
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
       response->close_connection_after_response = true;
     });
@@ -1560,6 +1568,7 @@ namespace nvhttp {
       BOOST_LOG(debug) << "Permission Get AppAsset denied for [" << named_cert_p->name << "] (" << (uint32_t)named_cert_p->perm << ")";
 
       fg.disable();
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
       response->close_connection_after_response = true;
       return;
@@ -1573,6 +1582,7 @@ namespace nvhttp {
     std::ifstream in(app_image, std::ios::binary);
     SimpleWeb::CaseInsensitiveMultimap headers;
     headers.emplace("Content-Type", "image/png");
+    response->close_connection_after_response = true;
     response->write(SimpleWeb::StatusCode::success_ok, in, headers);
     response->close_connection_after_response = true;
   }
@@ -1588,6 +1598,7 @@ namespace nvhttp {
     ) {
       BOOST_LOG(debug) << "Permission Read Clipboard denied for [" << named_cert_p->name << "] (" << (uint32_t)named_cert_p->perm << ")";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
       response->close_connection_after_response = true;
       return;
@@ -1598,6 +1609,7 @@ namespace nvhttp {
     if (clipboard_type != "text"sv) {
       BOOST_LOG(debug) << "Clipboard type [" << clipboard_type << "] is not supported!";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_bad_request);
       response->close_connection_after_response = true;
       return;
@@ -1614,12 +1626,14 @@ namespace nvhttp {
     if (!found) {
       BOOST_LOG(debug) << "Client ["<< named_cert_p->name << "] trying to get clipboard is not connected to a stream";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_forbidden);
       response->close_connection_after_response = true;
       return;
     }
 
     std::string content = platf::get_clipboard();
+    response->close_connection_after_response = true;
     response->write(content);
     return;
   }
@@ -1636,6 +1650,7 @@ namespace nvhttp {
     ) {
       BOOST_LOG(debug) << "Permission Write Clipboard denied for [" << named_cert_p->name << "] (" << (uint32_t)named_cert_p->perm << ")";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
       response->close_connection_after_response = true;
       return;
@@ -1646,6 +1661,7 @@ namespace nvhttp {
     if (clipboard_type != "text"sv) {
       BOOST_LOG(debug) << "Clipboard type [" << clipboard_type << "] is not supported!";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_bad_request);
       response->close_connection_after_response = true;
       return;
@@ -1662,6 +1678,7 @@ namespace nvhttp {
     if (!found) {
       BOOST_LOG(debug) << "Client ["<< named_cert_p->name << "] trying to set clipboard is not connected to a stream";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::client_error_forbidden);
       response->close_connection_after_response = true;
       return;
@@ -1674,10 +1691,12 @@ namespace nvhttp {
     if (!success) {
       BOOST_LOG(debug) << "Setting clipboard failed!";
 
+      response->close_connection_after_response = true;
       response->write(SimpleWeb::StatusCode::server_error_internal_server_error);
       response->close_connection_after_response = true;
     }
 
+    response->close_connection_after_response = true;
     response->write();
     return;
   }
