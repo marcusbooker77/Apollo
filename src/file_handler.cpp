@@ -43,7 +43,8 @@ namespace file_handler {
   }
 
   int write_file(const char *path, const std::string_view &contents) {
-    std::ofstream out(path);
+    std::string tmp_path = std::string(path) + ".tmp";
+    std::ofstream out(tmp_path);
 
     if (!out.is_open()) {
       return -1;
@@ -52,6 +53,17 @@ namespace file_handler {
     out << contents;
 
     if (out.fail()) {
+      std::error_code ec;
+      std::filesystem::remove(tmp_path, ec);
+      return -1;
+    }
+
+    out.close();
+
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+      std::filesystem::remove(tmp_path, ec);
       return -1;
     }
 

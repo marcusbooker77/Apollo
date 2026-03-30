@@ -437,19 +437,32 @@ namespace nvhttp {
     int x = 0;
     std::string segment;
     while (std::getline(mode, segment, 'x')) {
-      if (x == 0) {
-        launch_session->width = atoi(segment.c_str());
-      }
-      if (x == 1) {
-        launch_session->height = atoi(segment.c_str());
-      }
-      if (x == 2) {
-        auto fps = atof(segment.c_str());
-        if (fps < 1000) {
-          fps *= 1000;
-        };
-        launch_session->fps = (int)fps;
-        break;
+      try {
+        if (x == 0) {
+          launch_session->width = std::stoi(segment);
+          if (launch_session->width <= 0 || launch_session->width > 16384) {
+            x = -1; break;  // invalid, trigger fallback
+          }
+        }
+        if (x == 1) {
+          launch_session->height = std::stoi(segment);
+          if (launch_session->height <= 0 || launch_session->height > 16384) {
+            x = -1; break;
+          }
+        }
+        if (x == 2) {
+          auto fps = std::stod(segment);
+          if (fps <= 0 || fps > 1000000) {
+            x = -1; break;
+          }
+          if (fps < 1000) {
+            fps *= 1000;
+          };
+          launch_session->fps = (int)fps;
+          break;
+        }
+      } catch (...) {
+        x = -1; break;  // parse error, trigger fallback
       }
       x++;
     }

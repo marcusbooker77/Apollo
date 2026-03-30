@@ -115,7 +115,7 @@ namespace crypto {
     static int init_encrypt_gcm(cipher_ctx_t &ctx, aes_t *key, aes_t *iv, bool padding) {
       ctx.reset(EVP_CIPHER_CTX_new());
 
-      // Gen 7 servers use 128-bit AES ECB
+      // 128-bit AES GCM for authenticated encryption
       if (EVP_EncryptInit_ex(ctx.get(), EVP_aes_128_gcm(), nullptr, nullptr, nullptr) != 1) {
         return -1;
       }
