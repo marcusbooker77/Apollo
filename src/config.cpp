@@ -536,6 +536,25 @@ namespace config {
 
     ENCRYPTION_MODE_NEVER,  // lan_encryption_mode
     ENCRYPTION_MODE_OPPORTUNISTIC,  // wan_encryption_mode
+
+    // Adaptive streaming
+    true,   // adaptive_bitrate
+    true,   // adaptive_fec
+    true,   // frame_pacing
+    true,   // thermal_protection
+    2000,   // min_bitrate
+    40000,  // max_bitrate
+    10,     // min_fec_percentage
+    50,     // max_fec_percentage
+    4,      // max_pacing_buffer_ms
+    1080,   // thermal_step_down_resolution
+    30,     // thermal_step_down_fps
+    30,     // thermal_recovery_delay_s
+    true,   // smart_reconnect
+    30,     // smart_reconnect_timeout_s
+    2,      // max_suspended_sessions
+    true,   // wifi_quality_signaling
+    2,      // wifi_preemptive_drop_threshold
   };
 
   nvhttp_t nvhttp {
@@ -1246,6 +1265,25 @@ namespace config {
 
     path_f(vars, "file_apps", stream.file_apps);
     int_between_f(vars, "fec_percentage", stream.fec_percentage, {1, 255});
+
+    // Adaptive streaming
+    bool_f(vars, "adaptive_bitrate", stream.adaptive_bitrate);
+    bool_f(vars, "adaptive_fec", stream.adaptive_fec);
+    bool_f(vars, "frame_pacing", stream.frame_pacing);
+    bool_f(vars, "thermal_protection", stream.thermal_protection);
+    int_between_f(vars, "min_bitrate", stream.min_bitrate, {500, 100000});
+    int_between_f(vars, "max_bitrate_adaptive", stream.max_bitrate, {1000, 200000});
+    int_between_f(vars, "min_fec_percentage", stream.min_fec_percentage, {1, 100});
+    int_between_f(vars, "max_fec_percentage", stream.max_fec_percentage, {1, 100});
+    int_between_f(vars, "max_pacing_buffer_ms", stream.max_pacing_buffer_ms, {1, 50});
+    int_between_f(vars, "thermal_step_down_resolution", stream.thermal_step_down_resolution, {480, 2160});
+    int_between_f(vars, "thermal_step_down_fps", stream.thermal_step_down_fps, {15, 120});
+    int_between_f(vars, "thermal_recovery_delay_s", stream.thermal_recovery_delay_s, {5, 300});
+    bool_f(vars, "smart_reconnect", stream.smart_reconnect);
+    int_between_f(vars, "smart_reconnect_timeout_s", stream.smart_reconnect_timeout_s, {5, 300});
+    int_between_f(vars, "max_suspended_sessions", stream.max_suspended_sessions, {0, 10});
+    bool_f(vars, "wifi_quality_signaling", stream.wifi_quality_signaling);
+    int_between_f(vars, "wifi_preemptive_drop_threshold", stream.wifi_preemptive_drop_threshold, {1, 4});
 
     map_int_int_f(vars, "keybindings"s, input.keybindings);
 

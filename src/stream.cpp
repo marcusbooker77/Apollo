@@ -34,6 +34,7 @@ extern "C" {
 #include "system_tray.h"
 #include "thread_safe.h"
 #include "utility.h"
+#include "bitrate_controller.h"
 
 #define IDX_START_A 0
 #define IDX_START_B 1
@@ -53,6 +54,7 @@ extern "C" {
 #define IDX_SET_CLIPBOARD 16
 #define IDX_FILE_TRANSFER_NONCE_REQUEST 17
 #define IDX_SET_ADAPTIVE_TRIGGERS 18
+#define IDX_WIFI_QUALITY 19
 
 static const short packetTypes[] = {
   0x0305,  // Start A
@@ -74,6 +76,7 @@ static const short packetTypes[] = {
   0x3001,  // Set Clipboard (Apollo protocol extension)
   0x3002,  // File transfer nonce request (Apollo protocol extension)
   0x5503,  // Set Adaptive triggers (Sunshine protocol extension)
+  0x3003,  // WiFi Quality (Apollo protocol extension)
 };
 
 namespace asio = boost::asio;
@@ -423,6 +426,12 @@ namespace stream {
     safe::signal_t controlEnd;
 
     std::atomic<session::state_e> state;
+
+    // Adaptive streaming
+    stream::bitrate_controller_t bitrate_ctrl;
+
+    // Smart reconnect
+    std::chrono::steady_clock::time_point suspend_time;
   };
 
   /**
@@ -500,11 +509,51 @@ namespace stream {
     // Slow path - process new session
     TUPLE_2D(peer_port, peer_addr, platf::from_sockaddr_ex((sockaddr *) &peer->address.address));
     auto lg = _sessions.lock();
+
+    // Feature 6: Smart reconnect - check for suspended sessions first
+    for (auto pos = std::begin(*_sessions); pos != std::end(*_sessions); ++pos) {
+      auto session_p = *pos;
+
+      if (session_p->state.load(std::memory_order_acquire) != session::state_e::SUSPENDED) {
+        continue;
+      }
+
+      bool match = false;
+      if (session_p->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) {
+        match = (session_p->control.connect_data == connect_data);
+      } else {
+        match = (session_p->control.expected_peer_address == peer_addr);
+      }
+
+      if (match) {
+        BOOST_LOG(info) << "Smart reconnect: resuming suspended session"sv;
+        session_p->state.store(session::state_e::RUNNING, std::memory_order_release);
+        session_p->control.peer = peer;
+
+        auto local_address = platf::from_sockaddr((sockaddr *) &peer->localAddress.address);
+        session_p->localAddress = boost::asio::ip::make_address(local_address);
+
+        session_p->pingTimeout = std::chrono::steady_clock::now() + config::stream.ping_timeout;
+
+        // Request IDR frame for immediate decode after reconnect
+        session_p->video.idr_events->raise(true);
+
+        auto ptslg = _peer_to_session.lock();
+        _peer_to_session->emplace(peer, session_p);
+        return session_p;
+      }
+    }
+
     for (auto pos = std::begin(*_sessions); pos != std::end(*_sessions); ++pos) {
       auto session_p = *pos;
 
       // Skip sessions that are already established
       if (session_p->control.peer) {
+        continue;
+      }
+
+      // Skip suspended sessions (handled above)
+      if (session_p->state.load(std::memory_order_acquire) == session::state_e::SUSPENDED) {
         continue;
       }
 
@@ -608,8 +657,20 @@ namespace stream {
           break;
         case ENET_EVENT_TYPE_DISCONNECT:
           BOOST_LOG(info) << "CLIENT DISCONNECTED"sv;
-          // No more clients to send video data to ^_^
-          if (session->state == session::state_e::RUNNING) {
+          // Feature 6: Smart reconnect - suspend instead of stopping immediately
+          if (config::stream.smart_reconnect && session->state == session::state_e::RUNNING) {
+            BOOST_LOG(info) << "Smart reconnect: suspending session for up to "sv
+                           << config::stream.smart_reconnect_timeout_s << " seconds"sv;
+            session->state.store(session::state_e::SUSPENDED, std::memory_order_release);
+            session->suspend_time = std::chrono::steady_clock::now();
+
+            // Remove peer mapping but keep the session in the list
+            {
+              auto ptslg = _peer_to_session.lock();
+              _peer_to_session->erase(session->control.peer);
+            }
+            session->control.peer = nullptr;
+          } else if (session->state == session::state_e::RUNNING) {
             session::stop(*session);
           }
           break;
@@ -944,6 +1005,44 @@ namespace stream {
     return 0;
   }
 
+  /**
+   * @brief Send adaptive streaming stats to the client via control channel.
+   * @param session The session to send stats to.
+   * @return 0 on success.
+   */
+  int send_server_stats(session_t *session) {
+    if (!session->control.peer) {
+      return -1;
+    }
+
+    // Pack: encode_time(2) + bitrate(2) + fec_pct(1) + thermal(1) = 6 bytes
+    struct {
+      control_header_v2 header;
+      uint16_t bitrate_kbps;
+      uint16_t fec_pct_x10;  // FEC percentage * 10 for sub-percent precision
+      uint8_t fec_percentage;
+      uint8_t thermal_state;
+    } plaintext {};
+
+    plaintext.header.type = 0x3004;  // Apollo server stats extension
+    plaintext.header.payloadLength = sizeof(plaintext) - sizeof(control_header_v2);
+
+    plaintext.bitrate_kbps = util::endian::little((uint16_t)std::min(session->bitrate_ctrl.get_target_bitrate_kbps(), 65535));
+    plaintext.fec_pct_x10 = util::endian::little((uint16_t)(session->bitrate_ctrl.get_fec_percentage() * 10));
+    plaintext.fec_percentage = (uint8_t)session->bitrate_ctrl.get_fec_percentage();
+    plaintext.thermal_state = (uint8_t)session->bitrate_ctrl.get_thermal_state();
+
+    std::array<std::uint8_t, sizeof(control_encrypted_t) + crypto::cipher::round_to_pkcs7_padded(sizeof(plaintext)) + crypto::cipher::tag_size>
+      encrypted_payload;
+
+    auto payload = encode_control(session, util::view(plaintext), encrypted_payload);
+    if (session->broadcast_ref->control_server.send(payload, session->control.peer)) {
+      return -1;
+    }
+
+    return 0;
+  }
+
   void controlBroadcastThread(control_server_t *server) {
     server->map(packetTypes[IDX_PERIODIC_PING], [](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_PERIODIC_PING]"sv;
@@ -975,12 +1074,18 @@ namespace stream {
         << "time in milli since last report [" << t.count() << ']' << std::endl
         << "last good frame [" << lastGoodFrame << ']' << std::endl
         << "---end stats---";
+
+      // Feed loss stats to adaptive bitrate controller
+      // stats[2] is total packets sent in this interval (undocumented but present in Moonlight protocol)
+      auto packets_sent = stats[2] > 0 ? stats[2] : 1;
+      session->bitrate_ctrl.on_loss_stats(packets_sent, count);
     });
 
     server->map(packetTypes[IDX_REQUEST_IDR_FRAME], [&](session_t *session, const std::string_view &payload) {
       BOOST_LOG(debug) << "type [IDX_REQUEST_IDR_FRAME]"sv;
 
       session->video.idr_events->raise(true);
+      session->bitrate_ctrl.on_idr_request();
     });
 
     server->map(packetTypes[IDX_INVALIDATE_REF_FRAMES], [&](session_t *session, const std::string_view &payload) {
@@ -998,6 +1103,7 @@ namespace stream {
         << "lastFrame [" << lastFrame << ']';
 
       session->video.invalidate_ref_frames_events->raise(std::make_pair(firstFrame, lastFrame));
+      session->bitrate_ctrl.on_idr_request();
     });
 
     server->map(packetTypes[IDX_INPUT_DATA], [&](session_t *session, const std::string_view &payload) {
@@ -1091,6 +1197,22 @@ namespace stream {
       }
     });
 
+    // Feature 5: Handle WiFi quality reports from custom Apollo client
+    server->map(packetTypes[IDX_WIFI_QUALITY], [server](session_t *session, const std::string_view &payload) {
+      BOOST_LOG(verbose) << "type [IDX_WIFI_QUALITY]"sv;
+
+      if (payload.size() < 4) {
+        BOOST_LOG(warning) << "IDX_WIFI_QUALITY: payload too small"sv;
+        return;
+      }
+      int quality = (int)(uint8_t)payload.data()[0];
+      int rssi = (int)(int8_t)payload.data()[1];
+      int link_speed = util::endian::little(*(uint16_t *)(payload.data() + 2));
+
+      BOOST_LOG(verbose) << "WiFi quality: "sv << quality << " rssi: "sv << rssi << " link_speed: "sv << link_speed;
+      session->bitrate_ctrl.on_wifi_quality(quality, rssi, link_speed);
+    });
+
     server->map(packetTypes[IDX_ENCRYPTED], [server](session_t *session, const std::string_view &payload) {
       BOOST_LOG(verbose) << "type [IDX_ENCRYPTED]"sv;
 
@@ -1180,12 +1302,17 @@ namespace stream {
     // termination when we shut down.
     auto shutdown_event = mail::man->event<bool>(mail::shutdown);
     auto broadcast_shutdown_event = mail::man->event<bool>(mail::broadcast_shutdown);
+
+    // Periodic stats timer
+    auto last_stats_send = std::chrono::steady_clock::now();
+
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
 
       // Collect sessions needing I/O outside the lock to avoid holding mutex during network I/O
       std::vector<session_t *> sessions_with_feedback;
       std::vector<session_t *> sessions_with_hdr;
+      std::vector<session_t *> sessions_for_stats;
 
       {
         auto lg = server->_sessions.lock();
@@ -1204,6 +1331,18 @@ namespace stream {
             auto address = session->control.peer ? platf::from_sockaddr((sockaddr *) &session->control.peer->address.address) : session->control.expected_peer_address;
             BOOST_LOG(info) << address << ": Ping Timeout"sv;
             session::stop(*session);
+          }
+
+          // Feature 6: Smart reconnect - handle suspended sessions
+          if (session->state.load(std::memory_order_acquire) == session::state_e::SUSPENDED) {
+            auto elapsed = now - session->suspend_time;
+            if (elapsed > std::chrono::seconds(config::stream.smart_reconnect_timeout_s)) {
+              BOOST_LOG(info) << "Suspended session timed out, cleaning up"sv;
+              session->state.store(session::state_e::STOPPING, std::memory_order_release);
+            } else {
+              ++pos;
+              continue;  // Skip normal processing for suspended sessions
+            }
           }
 
           if (session->state.load(std::memory_order_acquire) == session::state_e::STOPPING) {
@@ -1234,6 +1373,10 @@ namespace stream {
             if (session->control.hdr_queue->peek()) {
               sessions_with_hdr.push_back(session);
             }
+            // Collect running sessions for periodic stats
+            if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
+              sessions_for_stats.push_back(session);
+            }
           }
 
           ++pos;
@@ -1253,6 +1396,17 @@ namespace stream {
         while (session->control.peer && hdr_queue->peek()) {
           auto hdr_info = hdr_queue->pop();
           send_hdr_mode(session, std::move(hdr_info));
+        }
+      }
+
+      // Feature 4: Send server stats periodically (~1 second interval)
+      {
+        auto stats_now = std::chrono::steady_clock::now();
+        if (stats_now - last_stats_send >= 1s) {
+          for (auto &session : sessions_for_stats) {
+            send_server_stats(session);
+          }
+          last_stats_send = stats_now;
         }
       }
 
@@ -1416,6 +1570,9 @@ namespace stream {
     auto ratecontrol_next_frame_start = std::chrono::steady_clock::now();
     std::vector<uint8_t> payload_new;
 
+    // Frame pacing: track inter-frame intervals
+    std::chrono::steady_clock::time_point last_frame_time {};
+
     while (auto packet = packets->pop()) {
       if (shutdown_event->peek()) {
         break;
@@ -1424,6 +1581,35 @@ namespace stream {
       frame_network_latency_logger.first_point_now();
 
       auto session = (session_t *) packet->channel_data;
+
+      // Feature 3: Frame pacing - record inter-frame intervals for jitter calculation
+      {
+        auto now = std::chrono::steady_clock::now();
+        if (last_frame_time.time_since_epoch().count() > 0) {
+          auto interval = std::chrono::duration_cast<std::chrono::microseconds>(now - last_frame_time);
+          session->bitrate_ctrl.record_frame_interval(interval);
+        }
+        last_frame_time = now;
+
+        // Apply pacing buffer if needed
+        auto pacing_us = session->bitrate_ctrl.get_pacing_buffer_us();
+        if (pacing_us > 0) {
+          std::this_thread::sleep_for(std::chrono::microseconds(pacing_us));
+        }
+      }
+
+      // Feature 4: Check thermal state and log if stepped down
+      {
+        auto thermal_res = session->bitrate_ctrl.get_thermal_resolution();
+        if (thermal_res > 0) {
+          BOOST_LOG(warning) << "Thermal protection: suggesting resolution step-down to "sv << thermal_res << "p"sv;
+        }
+        auto thermal_fps = session->bitrate_ctrl.get_thermal_fps();
+        if (thermal_fps > 0) {
+          BOOST_LOG(warning) << "Thermal protection: suggesting FPS step-down to "sv << thermal_fps;
+        }
+      }
+
       auto lowseq = session->video.lowseq;
 
       std::string_view payload {(char *) packet->data(), packet->data_size()};
@@ -1466,7 +1652,10 @@ namespace stream {
         frame_header.frame_processing_latency = 0;
       }
 
-      auto fecPercentage = config::stream.fec_percentage;
+      // Use adaptive FEC percentage from bitrate controller if enabled, otherwise use static config
+      auto fecPercentage = config::stream.adaptive_fec
+        ? session->bitrate_ctrl.get_fec_percentage()
+        : config::stream.fec_percentage;
 
       // Insert space for packet headers
       auto blocksize = session->config.packetsize + MAX_RTP_HEADER_SIZE;
@@ -2058,7 +2247,12 @@ namespace stream {
       auto expected = state_e::RUNNING;
       auto already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
       if (already_stopping) {
-        return;
+        // Also try transitioning from SUSPENDED
+        expected = state_e::SUSPENDED;
+        already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
+        if (already_stopping) {
+          return;
+        }
       }
 
       session.shutdown_event->raise(true);
@@ -2069,7 +2263,12 @@ namespace stream {
       auto expected = state_e::RUNNING;
       auto already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
       if (already_stopping) {
-        return;
+        // Also try transitioning from SUSPENDED
+        expected = state_e::SUSPENDED;
+        already_stopping = !session.state.compare_exchange_strong(expected, state_e::STOPPING);
+        if (already_stopping) {
+          return;
+        }
       }
 
       // reason: graceful termination
@@ -2295,6 +2494,23 @@ namespace stream {
 
       session->control.peer = nullptr;
       session->state.store(state_e::STOPPED, std::memory_order_relaxed);
+
+      // Initialize adaptive bitrate controller
+      session->bitrate_ctrl.init(config.monitor.bitrate, {
+        config::stream.adaptive_bitrate,
+        config::stream.adaptive_fec,
+        config::stream.frame_pacing,
+        config::stream.thermal_protection,
+        config::stream.min_bitrate,
+        config::stream.max_bitrate,
+        config::stream.min_fec_percentage,
+        config::stream.max_fec_percentage,
+        config::stream.max_pacing_buffer_ms,
+        config::stream.thermal_step_down_resolution,
+        config::stream.thermal_step_down_fps,
+        config::stream.thermal_recovery_delay_s,
+        config::stream.wifi_preemptive_drop_threshold
+      });
 
       session->mail = std::move(mail);
 

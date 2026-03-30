@@ -432,6 +432,20 @@ namespace video {
       return result;
     }
 
+    int update_bitrate(int new_bitrate_kbps) override {
+      if (!device || !device->nvenc) {
+        return -1;
+      }
+      return device->nvenc->update_bitrate(new_bitrate_kbps);
+    }
+
+    int update_resolution(int new_width, int new_height) override {
+      if (!device || !device->nvenc) {
+        return -1;
+      }
+      return device->nvenc->update_resolution(new_width, new_height);
+    }
+
   private:
     std::unique_ptr<platf::nvenc_encode_device_t> device;
     bool force_idr = false;

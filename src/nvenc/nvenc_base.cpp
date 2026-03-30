@@ -451,6 +451,11 @@ namespace nvenc {
       BOOST_LOG(info) << "NvEnc: created encoder " << video_format_string << quality_preset_string_from_guid(init_params.presetGUID) << extra;
     }
 
+    // Save encoder params and config for dynamic reconfiguration
+    saved_enc_config = enc_config;
+    saved_init_params = init_params;
+    saved_init_params.encodeConfig = &saved_enc_config;
+
     encoder_state = {};
     fail_guard.disable();
     return true;
@@ -607,6 +612,63 @@ namespace nvenc {
     }
 
     return true;
+  }
+
+  int nvenc_base::update_bitrate(int new_bitrate_kbps) {
+    if (!encoder) {
+      BOOST_LOG(warning) << "NvEnc: cannot update bitrate, encoder not initialized";
+      return -1;
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
+    reconfigure_params.reInitEncodeParams = saved_init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &saved_enc_config;
+
+    saved_enc_config.rcParams.averageBitRate = new_bitrate_kbps * 1000;
+    saved_enc_config.rcParams.maxBitRate = static_cast<uint32_t>(new_bitrate_kbps * 1000 * 1.5);
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
+      BOOST_LOG(warning) << "NvEnc: failed to reconfigure bitrate: " << last_nvenc_error_string;
+      return -1;
+    }
+
+    BOOST_LOG(info) << "NvEnc: bitrate reconfigured to " << new_bitrate_kbps << " kbps";
+    return 0;
+  }
+
+  int nvenc_base::update_resolution(int new_width, int new_height) {
+    if (!encoder) {
+      BOOST_LOG(warning) << "NvEnc: cannot update resolution, encoder not initialized";
+      return -1;
+    }
+
+    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
+    reconfigure_params.reInitEncodeParams = saved_init_params;
+    reconfigure_params.reInitEncodeParams.encodeConfig = &saved_enc_config;
+
+    reconfigure_params.reInitEncodeParams.encodeWidth = new_width;
+    reconfigure_params.reInitEncodeParams.darWidth = new_width;
+    reconfigure_params.reInitEncodeParams.encodeHeight = new_height;
+    reconfigure_params.reInitEncodeParams.darHeight = new_height;
+    reconfigure_params.resetEncoder = 1;
+    reconfigure_params.forceIDR = 1;
+
+    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
+      BOOST_LOG(warning) << "NvEnc: failed to reconfigure resolution to " << new_width << "x" << new_height
+                         << " (may require full reinit): " << last_nvenc_error_string;
+      return -1;
+    }
+
+    // Update stored params on success
+    saved_init_params.encodeWidth = new_width;
+    saved_init_params.darWidth = new_width;
+    saved_init_params.encodeHeight = new_height;
+    saved_init_params.darHeight = new_height;
+    encoder_params.width = new_width;
+    encoder_params.height = new_height;
+
+    BOOST_LOG(info) << "NvEnc: resolution reconfigured to " << new_width << "x" << new_height;
+    return 0;
   }
 
   bool nvenc_base::nvenc_failed(NVENCSTATUS status) {

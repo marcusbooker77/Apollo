@@ -44,6 +44,7 @@ namespace stream {
       STOPPING,  ///< The session is stopping
       STARTING,  ///< The session is starting
       RUNNING,  ///< The session is running
+      SUSPENDED,  ///< The session is suspended (smart reconnect)
     };
 
     std::shared_ptr<session_t> alloc(config_t &config, rtsp_stream::launch_session_t &launch_session);

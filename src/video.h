@@ -219,6 +219,25 @@ namespace video {
 
     virtual void invalidate_ref_frames(int64_t first_frame, int64_t last_frame) = 0;
 
+    /**
+     * @brief Dynamically change bitrate without reinitializing encoder.
+     * @param new_bitrate_kbps New target bitrate in kilobits per second.
+     * @return 0 on success, -1 if not supported or failed.
+     */
+    virtual int update_bitrate(int new_bitrate_kbps) {
+      return -1;
+    }
+
+    /**
+     * @brief Dynamically change resolution without reinitializing encoder.
+     * @param new_width New width in pixels.
+     * @param new_height New height in pixels.
+     * @return 0 on success, -1 if not supported or failed.
+     */
+    virtual int update_resolution(int new_width, int new_height) {
+      return -1;
+    }
+
     encoder_type_e encoder_type;
   };
 

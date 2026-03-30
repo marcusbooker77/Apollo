@@ -69,6 +69,21 @@ namespace nvenc {
      */
     bool invalidate_ref_frames(uint64_t first_frame, uint64_t last_frame);
 
+    /**
+     * @brief Dynamically change bitrate without reinitializing encoder.
+     * @param new_bitrate_kbps New target bitrate in kilobits per second.
+     * @return 0 on success, -1 on failure.
+     */
+    int update_bitrate(int new_bitrate_kbps);
+
+    /**
+     * @brief Dynamically change resolution without reinitializing encoder.
+     * @param new_width New width in pixels.
+     * @param new_height New height in pixels.
+     * @return 0 on success, -1 on failure.
+     */
+    int update_resolution(int new_width, int new_height);
+
   protected:
     /**
      * @brief Required. Used for loading NvEnc library and setting `nvenc` variable with `NvEncodeAPICreateInstance()`.
@@ -143,6 +158,9 @@ namespace nvenc {
   private:
     NV_ENC_OUTPUT_PTR output_bitstream = nullptr;
     uint32_t minimum_api_version = 0;
+
+    NV_ENC_INITIALIZE_PARAMS saved_init_params = {};
+    NV_ENC_CONFIG saved_enc_config = {};
 
     struct {
       uint64_t last_encoded_frame_index = 0;

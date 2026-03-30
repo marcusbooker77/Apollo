@@ -174,6 +174,25 @@ namespace config {
     // Video encryption settings for LAN and WAN streams
     int lan_encryption_mode;
     int wan_encryption_mode;
+
+    // Adaptive streaming
+    bool adaptive_bitrate = true;
+    bool adaptive_fec = true;
+    bool frame_pacing = true;
+    bool thermal_protection = true;
+    int min_bitrate = 2000;
+    int max_bitrate = 40000;
+    int min_fec_percentage = 10;
+    int max_fec_percentage = 50;
+    int max_pacing_buffer_ms = 4;
+    int thermal_step_down_resolution = 1080;
+    int thermal_step_down_fps = 30;
+    int thermal_recovery_delay_s = 30;
+    bool smart_reconnect = true;
+    int smart_reconnect_timeout_s = 30;
+    int max_suspended_sessions = 2;
+    bool wifi_quality_signaling = true;
+    int wifi_preemptive_drop_threshold = 2;
   };
 
   struct nvhttp_t {
