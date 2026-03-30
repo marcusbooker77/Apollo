@@ -590,6 +590,7 @@ namespace config {
     {},  // Username
     {},  // Password
     {},  // Password Salt
+    1,  // hash_version
     platf::appdata().string() + "/sunshine.conf",  // config file
     {},  // cmd args
     47989,  // Base port number

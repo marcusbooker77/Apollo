@@ -101,6 +101,12 @@ namespace nvhttp {
   };
 
   struct pair_session_t {
+    pair_session_t() = default;
+    pair_session_t(pair_session_t &&) = default;
+    pair_session_t &operator=(pair_session_t &&) = default;
+    pair_session_t(const pair_session_t &) = delete;
+    pair_session_t &operator=(const pair_session_t &) = delete;
+
     ~pair_session_t() {
       if (cipher_key) {
         OPENSSL_cleanse(cipher_key->data(), cipher_key->size());

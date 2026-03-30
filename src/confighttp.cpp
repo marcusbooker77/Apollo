@@ -1156,8 +1156,7 @@ namespace confighttp {
         // Reject values containing newline characters (config injection)
         if (v.is_string()) {
           auto val = v.get<std::string>();
-          if (val.find('
-') != std::string::npos || val.find('') != std::string::npos) {
+          if (val.find('\n') != std::string::npos || val.find('\r') != std::string::npos) {
             BOOST_LOG(warning) << "Rejected config value with newline for key: " << k;
             continue;
           }

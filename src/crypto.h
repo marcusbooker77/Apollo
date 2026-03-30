@@ -159,6 +159,14 @@ namespace crypto {
 
     class cipher_t {
     public:
+      cipher_t() = default;
+      cipher_t(cipher_ctx_t dec, cipher_ctx_t enc, aes_t k, bool pad)
+        : decrypt_ctx(std::move(dec)), encrypt_ctx(std::move(enc)), key(std::move(k)), padding(pad) {}
+      cipher_t(cipher_t &&) = default;
+      cipher_t &operator=(cipher_t &&) = default;
+      cipher_t(const cipher_t &) = delete;
+      cipher_t &operator=(const cipher_t &) = delete;
+
       ~cipher_t() {
         if (!key.empty()) {
           OPENSSL_cleanse(key.data(), key.size());
