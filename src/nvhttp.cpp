@@ -771,7 +771,8 @@ namespace nvhttp {
           return;
         }
 
-        auto ptr = map_id_sess.emplace(sess.client.uniqueID, std::move(sess)).first;
+        auto key = sess.client.uniqueID;  // capture before move
+        auto ptr = map_id_sess.emplace(std::move(key), std::move(sess)).first;
 
         ptr->second.async_insert_pin.salt = std::move(get_arg(args, "salt"));
 

@@ -434,8 +434,8 @@ namespace stream {
   template<std::size_t max_payload_size>
   static inline std::string_view encode_control(session_t *session, const std::string_view &plaintext, std::array<std::uint8_t, max_payload_size> &tagged_cipher) {
     static_assert(
-      max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size),
-      "max_payload_size >= sizeof(control_encrypted_t) + sizeof(crypto::cipher::tag_size)"
+      max_payload_size >= sizeof(control_encrypted_t) + crypto::cipher::tag_size,
+      "max_payload_size >= sizeof(control_encrypted_t) + crypto::cipher::tag_size"
     );
 
     if (session->config.controlProtocolType != 13) {

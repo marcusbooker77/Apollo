@@ -263,7 +263,7 @@ namespace http {
 
   std::string url_get_host(const std::string &url) {
     CURLU *curlu = curl_url();
-    curl_url_set(curlu, CURLUPART_URL, url.c_str(), static_cast<unsigned int>(url.length()));
+    curl_url_set(curlu, CURLUPART_URL, url.c_str(), 0);
     char *host;
     if (curl_url_get(curlu, CURLUPART_HOST, &host, 0) != CURLUE_OK) {
       curl_url_cleanup(curlu);

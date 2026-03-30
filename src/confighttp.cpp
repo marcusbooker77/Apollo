@@ -64,7 +64,7 @@ namespace confighttp {
 
   // SESSION COOKIE
   static std::mutex session_mutex;
-  std::string sessionCookie;
+  static std::string sessionCookie;
   static std::chrono::time_point<std::chrono::steady_clock> cookie_creation_time;
 
   // CSRF TOKEN
@@ -1213,7 +1213,7 @@ namespace confighttp {
         }
       } else {
         auto data = SimpleWeb::Crypto::Base64::decode(input_tree.value("data", ""));
-        std::ofstream imgfile(path);
+        std::ofstream imgfile(path, std::ios::binary);
         imgfile.write(data.data(), static_cast<int>(data.size()));
       }
       output_tree["status"] = true;
