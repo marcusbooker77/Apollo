@@ -115,6 +115,22 @@
   import ContainerEncoders from './configs/tabs/ContainerEncoders.vue'
   import {$tp, usePlatformI18n} from './platform-i18n'
 
+  let csrfToken = '';
+  async function fetchCsrf() {
+    try {
+      const resp = await fetch('./api/csrf-token', { credentials: 'include' });
+      const data = await resp.json();
+      if (data.csrf_token) csrfToken = data.csrf_token;
+    } catch (e) { /* ignore */ }
+  }
+  function csrfHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+  }
+  fetchCsrf();
+
   let fallbackDisplayModeCache = "";
 
   const app = createApp({
@@ -454,9 +470,7 @@
 
         return fetch("./api/config", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify(config),
         }).then((r) => {
@@ -481,9 +495,8 @@
             }, 5000);
             fetch("./api/restart", {
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              }
+              credentials: 'include',
+              headers: csrfHeaders()
             })
             .then((resp) => {
               if (resp.status !== 200) {

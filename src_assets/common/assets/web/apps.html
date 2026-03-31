@@ -528,6 +528,22 @@
   import Checkbox from './Checkbox.vue'
   import { Dropdown } from 'bootstrap/dist/js/bootstrap'
 
+  let csrfToken = '';
+  async function fetchCsrf() {
+    try {
+      const resp = await fetch('./api/csrf-token', { credentials: 'include' });
+      const data = await resp.json();
+      if (data.csrf_token) csrfToken = data.csrf_token;
+    } catch (e) { /* ignore */ }
+  }
+  function csrfHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+  }
+  fetchCsrf();
+
   const newApp = {
     "name": "New App",
     "output": "",
@@ -661,9 +677,7 @@
 
         fetch("./api/apps/reorder", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify({order: reorderedUUIDs})
         })
@@ -712,9 +726,7 @@
           this.actionDisabled = true;
           fetch("./api/apps/launch", {
             credentials: 'include',
-            headers: {
-              'Content-Type': 'application/json'
-            },
+            headers: csrfHeaders(),
             method: 'POST',
             body: JSON.stringify({ uuid: app.uuid })
           })
@@ -735,9 +747,7 @@
           this.actionDisabled = true;
           fetch("./api/apps/close", {
             credentials: 'include',
-            headers: {
-              'Content-Type': 'application/json'
-            },
+            headers: csrfHeaders(),
             method: 'POST',
           })
           .then((r) => r.json())
@@ -779,9 +789,7 @@
           this.actionDisabled = true;
           fetch("./api/apps/delete", {
             credentials: 'include',
-            headers: {
-              'Content-Type': 'application/json'
-            },
+            headers: csrfHeaders(),
             method: 'POST',
             body: JSON.stringify({ uuid: app.uuid })
           }).then((r) => r.json())
@@ -895,9 +903,7 @@
         this.coverFinderBusy = true;
         fetch("./api/covers/upload", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify({
             key: cover.key,
@@ -923,9 +929,7 @@
         delete this.editForm.dragover;
         fetch("./api/apps", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify(this.editForm),
         }).then((r) => r.json())

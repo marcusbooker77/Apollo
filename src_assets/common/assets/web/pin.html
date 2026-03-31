@@ -214,6 +214,22 @@
   import Navbar from './Navbar.vue'
   import Checkbox from './Checkbox.vue'
 
+  let csrfToken = '';
+  async function fetchCsrf() {
+    try {
+      const resp = await fetch('./api/csrf-token', { credentials: 'include' });
+      const data = await resp.json();
+      if (data.csrf_token) csrfToken = data.csrf_token;
+    } catch (e) { /* ignore */ }
+  }
+  function csrfHeaders() {
+    return {
+      'Content-Type': 'application/json',
+      'X-CSRF-Token': csrfToken
+    };
+  }
+  fetchCsrf();
+
   let resetOTPTimeout = null;
   const qrContainer = document.createElement('div');
   qrContainer.className = "mb-2 p-2 bg-white"
@@ -422,9 +438,7 @@
         let b = JSON.stringify({pin: pin, name: name});
         fetch("./api/pin", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: b
         })
@@ -452,9 +466,7 @@
 
         fetch("./api/otp", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify({ passphrase: this.passphrase, deviceName: this.deviceName })
         })
@@ -583,9 +595,7 @@
         }
         fetch("./api/clients/update", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify(editedClient)
         })
@@ -640,9 +650,7 @@
       disconnectClient(uuid) {
         fetch("./api/clients/disconnect", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify({ uuid })
         }).finally(() => {
@@ -656,9 +664,7 @@
         fetch("./api/clients/unpair-all", {
           credentials: 'include',
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
         })
           .then((r) => r.json())
           .then((r) => {
@@ -673,9 +679,7 @@
       unpairSingle(uuid) {
         fetch("./api/clients/unpair", {
           credentials: 'include',
-          headers: {
-            'Content-Type': 'application/json'
-          },
+          headers: csrfHeaders(),
           method: 'POST',
           body: JSON.stringify({ uuid })
         }).then(() => {

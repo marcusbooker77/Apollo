@@ -136,6 +136,22 @@
     import { initApp } from './init'
     import Navbar from './Navbar.vue'
 
+    let csrfToken = '';
+    async function fetchCsrf() {
+      try {
+        const resp = await fetch('./api/csrf-token', { credentials: 'include' });
+        const data = await resp.json();
+        if (data.csrf_token) csrfToken = data.csrf_token;
+      } catch (e) { /* ignore */ }
+    }
+    function csrfHeaders() {
+      return {
+        'Content-Type': 'application/json',
+        'X-CSRF-Token': csrfToken
+      };
+    }
+    fetchCsrf();
+
     const app = createApp({
       components: {
         Navbar
@@ -208,9 +224,7 @@
           fetch("./api/apps/close", {
             credentials: 'include',
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            }
+            headers: csrfHeaders()
           })
             .then((r) => r.json())
             .then((r) => {
@@ -232,9 +246,7 @@
           fetch("./api/restart", {
             credentials: 'include',
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            }
+            headers: csrfHeaders()
           })
           .then((resp) => {
             if (resp.status !== 200) {
@@ -259,9 +271,7 @@
             fetch("./api/quit", {
               credentials: 'include',
               method: 'POST',
-              headers: {
-                'Content-Type': 'application/json'
-              }
+              headers: csrfHeaders()
             })
             .then(() => {
               this.serverQuitting = false;
@@ -279,9 +289,7 @@
           fetch("/api/reset-display-device-persistence", {
             credentials: 'include',
             method: 'POST',
-            headers: {
-              'Content-Type': 'application/json'
-            }
+            headers: csrfHeaders()
           })
             .then((r) => r.json())
             .then((r) => {
