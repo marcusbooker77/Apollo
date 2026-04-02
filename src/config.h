@@ -278,6 +278,7 @@ namespace config {
   struct sunshine_t {
     bool hide_tray_controls;
     bool enable_pairing;
+    bool pin_required;  ///< When false, auto-accept pairing without PIN prompt
     bool enable_discovery;
     bool envvar_compatibility_mode;
     std::string locale;

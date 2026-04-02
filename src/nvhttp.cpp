@@ -840,7 +840,15 @@ namespace nvhttp {
           return;
         }
 
-        if (config::sunshine.flags[config::flag::PIN_STDIN]) {
+        if (!config::sunshine.pin_required) {
+          // PIN requirement disabled — use a fixed known PIN "0000"
+          // The client must also use "0000" as the PIN for the handshake to succeed.
+          // Moonlight clients show a random PIN — user must type "0000" instead.
+          // This skips the server-side prompt entirely.
+          BOOST_LOG(info) << "PIN requirement disabled — auto-accepting pairing for device: "
+                          << ptr->second.client.name << " (fixed PIN: 0000)";
+          getservercert(ptr->second, tree, "0000");
+        } else if (config::sunshine.flags[config::flag::PIN_STDIN]) {
           std::string pin;
 
           std::cout << "Please insert pin: "sv;
