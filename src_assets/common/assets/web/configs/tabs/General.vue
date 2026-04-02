@@ -52,6 +52,10 @@ onMounted(() => {
   if (config.value.enable_pairing === undefined) {
     config.value.enable_pairing = "enabled"
   }
+  // Set default value for pin_required if not present
+  if (config.value.pin_required === undefined) {
+    config.value.pin_required = "enabled"
+  }
 })
 </script>
 
@@ -210,6 +214,14 @@ onMounted(() => {
               id="enable_pairing"
               locale-prefix="config"
               v-model="config.enable_pairing"
+              default="true"
+    ></Checkbox>
+
+    <!-- Require PIN for Pairing -->
+    <Checkbox class="mb-3"
+              id="pin_required"
+              locale-prefix="config"
+              v-model="config.pin_required"
               default="true"
     ></Checkbox>
 

@@ -257,6 +257,8 @@
     "enable_input_only_mode_desc": "Add an Input Only app entry. When enabled, the app list will only show the current running app and the Input Only entry when streaming. The Input Only entry will not receive any image or audio. Useful for operating the desktop on TV or connecting peripherals which the TV doesn't support with a phone.",
     "enable_pairing": "Enable Pairing",
     "enable_pairing_desc": "Enable pairing for the Moonlight client. This allows the client to authenticate with the host and establish a secure connection.",
+    "pin_required": "Require PIN for Pairing",
+    "pin_required_desc": "When enabled, you must enter the client's PIN on the server to complete pairing. When disabled, pairing is auto-accepted using a fixed PIN (0000). Type 0000 on the client instead of the displayed PIN.",
     "encoder": "Force a Specific Encoder",
     "encoder_desc": "Force a specific encoder, otherwise Apollo will select the best available option. Note: If you specify a hardware encoder on Windows, it must match the GPU where the display is connected.",
     "encoder_software": "Software",
