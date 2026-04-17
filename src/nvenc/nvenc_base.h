@@ -33,6 +33,14 @@ namespace nvenc {
 
     nvenc_base(const nvenc_base &) = delete;
     nvenc_base &operator=(const nvenc_base &) = delete;
+    // Also non-movable: saved_init_params.encodeConfig holds a pointer
+    // to this->saved_enc_config (set in init_encoder); a defaulted move
+    // would bitwise-copy the pointer so the moved-from object's
+    // saved_enc_config dangles, then any read of saved_init_params via
+    // the moved-to object indirects into freed memory after the
+    // moved-from object is destroyed.
+    nvenc_base(nvenc_base &&) = delete;
+    nvenc_base &operator=(nvenc_base &&) = delete;
 
     /**
      * @brief Create the encoder.

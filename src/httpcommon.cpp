@@ -69,10 +69,35 @@ namespace http {
   }
 
   std::string hash_password(const std::string &password, const std::string &salt, int hash_version) {
-    constexpr int HASH_ITERATIONS = 100000;
+    // v1: single SHA-256(password || salt) — kept for verifying existing
+    //     credentials. New writes never produce v1.
+    // v2: 100k rounds of plain SHA-256 chained on the prior digest, no
+    //     per-round salt/HMAC. Iterated SHA-256 is much cheaper to GPU-
+    //     attack than PBKDF2-HMAC at the same iteration count. Kept for
+    //     verifying existing credentials.
+    // v3: PBKDF2-HMAC-SHA256 with 600k iterations. NIST SP 800-132 +
+    //     OWASP 2023 recommendation for PBKDF2-SHA256. Use this for
+    //     new writes; v1/v2 readers stay compatible until next login,
+    //     at which point save_user_creds re-saves at v3.
+    constexpr int V2_HASH_ITERATIONS = 100000;
+    constexpr int V3_PBKDF2_ITERATIONS = 600000;
+    constexpr int OUT_BYTES = 32;  // SHA-256 digest size
+
+    if (hash_version >= 3) {
+      std::array<uint8_t, OUT_BYTES> out{};
+      if (PKCS5_PBKDF2_HMAC(password.data(), (int) password.size(),
+                            reinterpret_cast<const uint8_t *>(salt.data()), (int) salt.size(),
+                            V3_PBKDF2_ITERATIONS, EVP_sha256(),
+                            (int) out.size(), out.data()) != 1) {
+        BOOST_LOG(fatal) << "PKCS5_PBKDF2_HMAC failed — refusing to emit weak hash; aborting";
+        std::abort();
+      }
+      return util::hex(out).to_string();
+    }
+
     auto hash_result = crypto::hash(password + salt);
     if (hash_version >= 2) {
-      for (int i = 1; i < HASH_ITERATIONS; ++i) {
+      for (int i = 1; i < V2_HASH_ITERATIONS; ++i) {
         std::string_view hash_view(reinterpret_cast<const char *>(hash_result.data()), hash_result.size());
         hash_result = crypto::hash(hash_view);
       }
@@ -94,11 +119,12 @@ namespace http {
     }
 
     auto salt = crypto::rand_alphabet(16);
-    constexpr int CURRENT_HASH_VERSION = 2;
+    constexpr int CURRENT_HASH_VERSION = 3;
     outputTree["username"] = username;
     outputTree["salt"] = salt;
     outputTree["password"] = hash_password(password, salt, CURRENT_HASH_VERSION);
-    outputTree["hash_version"] = CURRENT_HASH_VERSION;  // v1 = single SHA-256, v2 = iterated 100k rounds
+    // v1 = single SHA-256, v2 = iterated 100k SHA-256, v3 = PBKDF2-HMAC-SHA256 600k
+    outputTree["hash_version"] = CURRENT_HASH_VERSION;
     try {
       std::ofstream out(file);
       out << outputTree.dump(4);  // Pretty-print with an indent of 4 spaces.

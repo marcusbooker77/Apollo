@@ -1152,7 +1152,13 @@ namespace stream {
         BOOST_LOG(warning) << "IDX_INPUT_DATA: payload too small"sv;
         return;
       }
-      auto tagged_cipher_length = util::endian::big(*(int32_t *) payload.data());
+      // Use memcpy instead of *(int32_t*)payload.data() — payload is a
+      // std::string_view backed by ENet's receive buffer with no
+      // alignment guarantee; the unaligned access faults on ARM/RISC-V
+      // and is UB on x86/x64 even though it usually works.
+      int32_t cipher_length_be = 0;
+      std::memcpy(&cipher_length_be, payload.data(), sizeof(cipher_length_be));
+      auto tagged_cipher_length = util::endian::big(cipher_length_be);
       if (tagged_cipher_length < 0 || (size_t) tagged_cipher_length > payload.size() - sizeof(int32_t)) {
         BOOST_LOG(warning) << "IDX_INPUT_DATA: invalid cipher length"sv;
         return;
@@ -2557,7 +2563,10 @@ namespace stream {
       };
 
       session->audio.ping_payload = launch_session.av_ping_payload;
-      session->audio.avRiKeyId = util::endian::big(*(std::uint32_t *) launch_session.iv.data());
+      // memcpy for the same alignment-safety reason as IDX_INPUT_DATA.
+      std::uint32_t avRiKeyId_be = 0;
+      std::memcpy(&avRiKeyId_be, launch_session.iv.data(), sizeof(avRiKeyId_be));
+      session->audio.avRiKeyId = util::endian::big(avRiKeyId_be);
       session->audio.sequenceNumber = 0;
       session->audio.timestamp = 0;
 

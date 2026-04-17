@@ -406,7 +406,14 @@ namespace crypto {
     r.resize(bytes);
 
     if (RAND_bytes((uint8_t *) r.data(), r.size()) != 1) {
-      BOOST_LOG(error) << "RAND_bytes failed — random data may be insufficient";
+      // Returning whatever was on the stack would let downstream code
+      // (PINs, session cookies, CSRF tokens, AES IVs) ship predictable
+      // bytes — a credential-grade RNG failure is unrecoverable from
+      // here. Abort so the caller doesn't generate weak secrets and
+      // so monitoring catches the failure (rather than producing a
+      // silently-vulnerable session).
+      BOOST_LOG(fatal) << "RAND_bytes failed — refusing to emit weak randomness; aborting";
+      std::abort();
     }
 
     return r;
@@ -513,6 +520,17 @@ namespace crypto {
 
   std::string rand_alphabet(std::size_t bytes, const std::string_view &alphabet) {
     auto len = alphabet.length();
+    if (len == 0 || len > 256) {
+      // The rejection-sampling loop below assumes a uint8_t source can
+      // index into the alphabet via modulo. An alphabet of length > 256
+      // means the modulo result can never exceed 255 — the loop spins
+      // forever generating only the first 256 chars. Length 0 is an
+      // obvious caller bug. Both are programmer errors, not runtime
+      // conditions; refuse rather than hang or mis-distribute.
+      BOOST_LOG(fatal) << "rand_alphabet: alphabet size " << len
+                       << " out of supported range [1, 256]; aborting";
+      std::abort();
+    }
     auto limit = (256 / len) * len;  // rejection threshold to avoid modulo bias
     std::string result;
     result.reserve(bytes);

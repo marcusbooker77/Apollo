@@ -75,6 +75,26 @@ namespace confighttp {
   static constexpr auto LOGIN_LOCKOUT_DURATION = 5min;
   static std::unordered_map<std::string, std::pair<int, std::chrono::steady_clock::time_point>> login_attempts_by_ip;
 
+  // Reduce a remote address to a "lockout key" — for IPv6 we drop the
+  // last 64 bits so privacy-extension /128 rotation can't bypass the
+  // lockout. For IPv4 the full address is the key. The caller should
+  // pass the result of net::addr_to_normalized_string (already
+  // IPv4-mapped → v4 normalized) so we don't double-bucket.
+  static std::string to_lockout_key(const std::string &normalized_addr) {
+    boost::system::error_code ec;
+    auto addr = boost::asio::ip::make_address(normalized_addr, ec);
+    if (ec || addr.is_v4()) {
+      return normalized_addr;
+    }
+    if (addr.is_v6()) {
+      auto bytes = addr.to_v6().to_bytes();
+      // /64 prefix: keep first 8 bytes, zero the rest.
+      for (size_t i = 8; i < bytes.size(); i++) bytes[i] = 0;
+      return boost::asio::ip::make_address_v6(bytes).to_string() + "/64";
+    }
+    return normalized_addr;
+  }
+
   /**
    * @brief Log the request details.
    * @param request The HTTP request object.
@@ -564,15 +584,54 @@ namespace confighttp {
    * @param query The path to check.
    * @return True if the path is a child of the base path, false otherwise.
    */
+  // Returns true if `child` resolves to a path that lives under `parent`.
+  //
+  // The previous implementation:
+  //   - did a string prefix match (case-sensitive) against weakly_canonical
+  //     output, which on Windows let "C:\Apollo\Assets\..\..\..\Windows"
+  //     pass when the case differed (NTFS is case-insensitive),
+  //   - had no try/catch around weakly_canonical, which throws
+  //     filesystem_error on Windows reparse points / SMB unreachable
+  //     paths,
+  //   - separators differ between platforms; lexicographic prefix match
+  //     would mis-fire on mixed forward/back slashes,
+  //   - silently flipped the parameter order vs upstream's convention
+  //     (which was (parent, child)).
+  //
+  // The fix uses lexically_relative against the canonicalised forms.
+  // If the result starts with ".." (or is empty), child is NOT inside
+  // parent. On Windows we make_preferred() and case-fold both sides so
+  // the prefix check survives mixed-case access.
   bool isChildPath(fs::path const &child, fs::path const &parent) {
-    auto canonical_child = fs::weakly_canonical(child).string();
-    auto canonical_parent = fs::weakly_canonical(parent).string();
-    // Ensure parent ends with separator for prefix match
-    if (!canonical_parent.empty() && canonical_parent.back() != fs::path::preferred_separator) {
-      canonical_parent += fs::path::preferred_separator;
+    fs::path c, p;
+    try {
+      c = fs::weakly_canonical(child);
+      p = fs::weakly_canonical(parent);
+    } catch (const std::exception &e) {
+      BOOST_LOG(warning) << "isChildPath: canonicalise failed (" << e.what()
+                         << "); refusing path";
+      return false;
     }
-    return canonical_child.size() >= canonical_parent.size() &&
-           canonical_child.compare(0, canonical_parent.size(), canonical_parent) == 0;
+
+#ifdef _WIN32
+    // Normalise separators and case so the prefix check survives
+    // NTFS case-insensitivity. We can't easily resolve 8.3 short
+    // names without a Windows API call; the security implication is
+    // documented by the audit and is a best-effort defence.
+    c.make_preferred();
+    p.make_preferred();
+    auto to_lower = [](std::wstring s) {
+      for (auto &ch : s) ch = std::towlower(ch);
+      return s;
+    };
+    auto rel = fs::path(to_lower(c.wstring())).lexically_relative(
+        fs::path(to_lower(p.wstring())));
+#else
+    auto rel = c.lexically_relative(p);
+#endif
+    if (rel.empty()) return false;
+    auto first = rel.begin()->string();
+    return first != "..";
   }
 
   /**
@@ -1645,6 +1704,9 @@ namespace confighttp {
     }
 
     auto address = net::addr_to_normalized_string(request->remote_endpoint().address());
+    // Bucket by /64 prefix on IPv6 so privacy-extension /128 rotation
+    // can't bypass the lockout. IPv4 stays as the full /32.
+    auto address_key = to_lockout_key(address);
 
     // Per-IP rate limiting
     {
@@ -1660,7 +1722,7 @@ namespace confighttp {
         }
       }
 
-      auto it = login_attempts_by_ip.find(address);
+      auto it = login_attempts_by_ip.find(address_key);
       if (it != login_attempts_by_ip.end()) {
         auto &[fail_count, lockout_until] = it->second;
         if (fail_count >= MAX_LOGIN_ATTEMPTS && now < lockout_until) {
@@ -1672,11 +1734,16 @@ namespace confighttp {
 
     auto fg = util::fail_guard([&]{
       std::lock_guard<std::mutex> lock(session_mutex);
-      auto &[fail_count, lockout_until] = login_attempts_by_ip[address];
+      auto &[fail_count, lockout_until] = login_attempts_by_ip[address_key];
       fail_count++;
-      if (fail_count >= MAX_LOGIN_ATTEMPTS) {
+      // Set the lockout deadline ONLY on the transition to MAX
+      // (the Nth failure). Setting it on every subsequent failure
+      // extended the lockout from each new attempt — an attacker
+      // could prevent the legitimate user from ever re-entering
+      // simply by hammering the endpoint.
+      if (fail_count == MAX_LOGIN_ATTEMPTS) {
         lockout_until = std::chrono::steady_clock::now() + LOGIN_LOCKOUT_DURATION;
-        BOOST_LOG(warning) << "Login locked out for 5 minutes for IP " << address << " after " << fail_count << " failed attempts";
+        BOOST_LOG(warning) << "Login locked out for 5 minutes for IP key " << address_key << " after " << fail_count << " failed attempts";
       }
       response->write(SimpleWeb::StatusCode::client_error_unauthorized);
     });
@@ -1696,7 +1763,7 @@ namespace confighttp {
         return;
       {
         std::lock_guard<std::mutex> lock(session_mutex);
-        login_attempts_by_ip.erase(address);  // reset on success
+        login_attempts_by_ip.erase(address_key);  // reset on success
         std::string sessionCookieRaw = crypto::rand_alphabet(64);
         sessionCookie = util::hex(crypto::hash(sessionCookieRaw + config::sunshine.salt)).to_string();
         cookie_creation_time = std::chrono::steady_clock::now();

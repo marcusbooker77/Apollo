@@ -68,8 +68,19 @@ namespace nvhttp {
   static std::string otp_device_name;
   static std::chrono::time_point<std::chrono::steady_clock> otp_creation_time;
   static std::recursive_mutex pairing_mutex;
-  static int otp_fail_count = 0;
+  // Per-IP OTP failure tracking. The previous global counter let any
+  // failed attempt (potentially from a malicious client) lock out all
+  // other clients, and request_otp() didn't reset it — so a fresh PIN
+  // was effectively dead-on-arrival after 3 prior failures from
+  // anywhere on the network.
+  static std::unordered_map<std::string, int> otp_fail_by_ip;
+  static std::mutex otp_fail_mutex;
   static constexpr int MAX_OTP_ATTEMPTS = 3;
+  // PIN length constants — kept in one place so generator and validator
+  // can't drift. PIN_LEN_INTERACTIVE matches Moonlight's 4-digit UI;
+  // PIN_LEN_OTP matches request_otp / rand_alphabet output.
+  static constexpr size_t PIN_LEN_INTERACTIVE = 4;
+  static constexpr size_t PIN_LEN_OTP = 6;
 
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
   public:
@@ -753,6 +764,11 @@ namespace nvhttp {
     }
 
     auto args = request->parse_query_string();
+    // Capture client IP up-front for per-IP OTP fail tracking (used in
+    // the OTP path below). The exact remote endpoint may live behind a
+    // socket type the request exposes via remote_endpoint_address(); we
+    // use it as the per-IP key.
+    const std::string client_ip = request->remote_endpoint_address();
     if (args.find("uniqueid"s) == std::end(args)) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Missing uniqueid parameter");
@@ -793,29 +809,35 @@ namespace nvhttp {
 
         auto it = args.find("otpauth");
         if (it != std::end(args)) {
+          // Read this IP's failure count under the otp_fail_mutex.
+          int this_ip_fails = 0;
+          {
+            std::lock_guard<std::mutex> lk(otp_fail_mutex);
+            auto it_fail = otp_fail_by_ip.find(client_ip);
+            if (it_fail != otp_fail_by_ip.end()) this_ip_fails = it_fail->second;
+          }
+
           if (one_time_pin.empty() || (std::chrono::steady_clock::now() - otp_creation_time > OTP_EXPIRE_DURATION)) {
             OPENSSL_cleanse(one_time_pin.data(), one_time_pin.size());
             one_time_pin.clear();
             OPENSSL_cleanse(otp_passphrase.data(), otp_passphrase.size());
             otp_passphrase.clear();
             otp_device_name.clear();
-            otp_fail_count = 0;
             tree.put("root.<xmlattr>.status_code", 503);
             tree.put("root.<xmlattr>.status_message", "OTP auth not available.");
-          } else if (otp_fail_count >= MAX_OTP_ATTEMPTS) {
-            OPENSSL_cleanse(one_time_pin.data(), one_time_pin.size());
-            one_time_pin.clear();
-            OPENSSL_cleanse(otp_passphrase.data(), otp_passphrase.size());
-            otp_passphrase.clear();
-            otp_device_name.clear();
-            otp_fail_count = 0;
+          } else if (this_ip_fails >= MAX_OTP_ATTEMPTS) {
+            // Lock out only this IP; do NOT wipe the live PIN — that
+            // would let one bad client deny service to everyone else.
             tree.put("root.<xmlattr>.status_code", 429);
-            tree.put("root.<xmlattr>.status_message", "Too many OTP attempts. Request a new PIN.");
+            tree.put("root.<xmlattr>.status_message", "Too many OTP attempts from this address. Request a new PIN.");
           } else {
             auto hash = util::hex(crypto::hash(one_time_pin + ptr->second.async_insert_pin.salt + otp_passphrase), true);
 
             if (util::crypto_equal(hash.to_string_view(), it->second)) {
-              otp_fail_count = 0;
+              {
+                std::lock_guard<std::mutex> lk(otp_fail_mutex);
+                otp_fail_by_ip.erase(client_ip);
+              }
 
               if (!otp_device_name.empty()) {
                 ptr->second.client.name = std::move(otp_device_name);
@@ -830,8 +852,13 @@ namespace nvhttp {
               otp_device_name.clear();
               return;
             } else {
-              otp_fail_count++;
-              BOOST_LOG(warning) << "OTP attempt " << otp_fail_count << "/" << MAX_OTP_ATTEMPTS << " failed";
+              int new_count;
+              {
+                std::lock_guard<std::mutex> lk(otp_fail_mutex);
+                new_count = ++otp_fail_by_ip[client_ip];
+              }
+              BOOST_LOG(warning) << "OTP attempt " << new_count << "/" << MAX_OTP_ATTEMPTS
+                                 << " failed (from " << client_ip << ")";
             }
           }
 
@@ -912,13 +939,18 @@ namespace nvhttp {
       return false;
     }
 
-    // ensure pin is 4 digits
-    if (pin.size() != 4) {
+    // Accept either a 4-digit interactive PIN (Moonlight UI) or a
+    // 6-digit OTP (server-generated via request_otp / rand_alphabet).
+    // Sharing one constant prevents the validator and the generator
+    // from drifting out of sync — the prior code rejected anything ≠ 4
+    // even though request_otp emits 6.
+    if (pin.size() != PIN_LEN_INTERACTIVE && pin.size() != PIN_LEN_OTP) {
       tree.put("root.paired", 0);
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put(
         "root.<xmlattr>.status_message",
-        std::format("Pin must be 4 digits, {} provided", pin.size())
+        std::format("Pin must be {} or {} digits, {} provided",
+                    PIN_LEN_INTERACTIVE, PIN_LEN_OTP, pin.size())
       );
       return false;
     }
@@ -1869,10 +1901,18 @@ namespace nvhttp {
       return "";
     }
 
-    one_time_pin = crypto::rand_alphabet(6, "0123456789"sv);
+    one_time_pin = crypto::rand_alphabet(PIN_LEN_OTP, "0123456789"sv);
     otp_passphrase = passphrase;
     otp_device_name = deviceName;
     otp_creation_time = std::chrono::steady_clock::now();
+
+    // Reset all per-IP OTP failure counters on PIN regeneration. Without
+    // this a fresh PIN is dead-on-arrival for any client that previously
+    // failed three times — they immediately hit the lockout branch.
+    {
+      std::lock_guard<std::mutex> lk(otp_fail_mutex);
+      otp_fail_by_ip.clear();
+    }
 
     return one_time_pin;
   }
