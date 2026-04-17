@@ -190,6 +190,11 @@ namespace config {
     int thermal_recovery_delay_s = 30;
     bool smart_reconnect = true;
     int smart_reconnect_timeout_s = 30;
+    // For legacy clients without ML_FF_SESSION_ID_V1, the suspended-
+    // session match defaults to "no, fall through to fresh pair" — an
+    // IP-only match lets any same-NAT peer hijack the session and
+    // inherit the AES-GCM keys. Users on a trusted LAN can opt back in.
+    bool smart_reconnect_legacy_ip_match = false;
     int max_suspended_sessions = 2;
     bool wifi_quality_signaling = true;
     int wifi_preemptive_drop_threshold = 2;

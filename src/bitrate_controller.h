@@ -32,10 +32,18 @@ namespace stream {
   class bitrate_controller_t {
   public:
     struct config_t {
-      bool adaptive_bitrate = true;
+      // adaptive_bitrate / thermal_protection default OFF: the plumbing
+      // to actually apply the computed bitrate to the encoder is not
+      // wired (nvenc_base::update_bitrate exists and the virtual
+      // encode_session_t::update_bitrate exists, but no caller invokes
+      // them — see stream.cpp where the previous TODO comment lived).
+      // Until the encode-thread queue is in place, these defaults made
+      // the feature emit log lines and stats packets without actually
+      // adapting anything. User can opt back in after wiring lands.
+      bool adaptive_bitrate = false;
       bool adaptive_fec = true;
       bool frame_pacing = true;
-      bool thermal_protection = true;
+      bool thermal_protection = false;
       int min_bitrate_kbps = 2000;
       int max_bitrate_kbps = 40000;
       int min_fec_percentage = 10;

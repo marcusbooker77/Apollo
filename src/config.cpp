@@ -552,6 +552,7 @@ namespace config {
     30,     // thermal_recovery_delay_s
     true,   // smart_reconnect
     30,     // smart_reconnect_timeout_s
+    false,  // smart_reconnect_legacy_ip_match (off by default — see config.h)
     2,      // max_suspended_sessions
     true,   // wifi_quality_signaling
     2,      // wifi_preemptive_drop_threshold
@@ -1282,6 +1283,7 @@ namespace config {
     int_between_f(vars, "thermal_recovery_delay_s", stream.thermal_recovery_delay_s, {5, 300});
     bool_f(vars, "smart_reconnect", stream.smart_reconnect);
     int_between_f(vars, "smart_reconnect_timeout_s", stream.smart_reconnect_timeout_s, {5, 300});
+    bool_f(vars, "smart_reconnect_legacy_ip_match", stream.smart_reconnect_legacy_ip_match);
     int_between_f(vars, "max_suspended_sessions", stream.max_suspended_sessions, {0, 10});
     bool_f(vars, "wifi_quality_signaling", stream.wifi_quality_signaling);
     int_between_f(vars, "wifi_preemptive_drop_threshold", stream.wifi_preemptive_drop_threshold, {1, 4});

@@ -531,9 +531,28 @@ namespace stream {
 
       bool match = false;
       if (session_p->config.mlFeatureFlags & ML_FF_SESSION_ID_V1) {
+        // 32-bit token match. Still trivially guessable (~4B keys, no
+        // throttle) but at least it requires the attacker to have seen
+        // the original handshake. Pair with the AES-GCM key — an
+        // attacker who guesses the token wrong will fail decryption on
+        // the first encrypted control packet anyway. Future fix: require
+        // an HMAC over a server-issued nonce using the existing cipher
+        // key BEFORE swapping control.peer.
         match = (session_p->control.connect_data == connect_data);
       } else {
-        match = (session_p->control.expected_peer_address == peer_addr);
+        // Legacy clients (no ML_FF_SESSION_ID_V1): the prior code
+        // accepted IP-equality as proof-of-identity, which means any
+        // peer behind the same NAT (corporate Wi-Fi, university dorm,
+        // shared ISP CGNAT) could hijack a suspended session. The IP-
+        // only fallback is now hard-disabled — legacy clients fall
+        // through to a fresh pairing instead. The user can revert this
+        // by adding `smart_reconnect_legacy_ip_match = enabled` to
+        // sunshine.conf if they accept the risk on a trusted network.
+        if (config::stream.smart_reconnect_legacy_ip_match) {
+          BOOST_LOG(warning) << "Smart reconnect: matching legacy client by IP only "
+                                "(smart_reconnect_legacy_ip_match=enabled — only safe on a trusted LAN)";
+          match = (session_p->control.expected_peer_address == peer_addr);
+        }
       }
 
       if (match) {

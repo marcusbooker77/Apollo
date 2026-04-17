@@ -620,20 +620,18 @@ namespace nvenc {
       return -1;
     }
 
-    NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
-    reconfigure_params.reInitEncodeParams = saved_init_params;
-    reconfigure_params.reInitEncodeParams.encodeConfig = &saved_enc_config;
-
-    saved_enc_config.rcParams.averageBitRate = new_bitrate_kbps * 1000;
-    saved_enc_config.rcParams.maxBitRate = static_cast<uint32_t>(new_bitrate_kbps * 1000 * 1.5);
-
-    if (nvenc_failed(nvenc->nvEncReconfigureEncoder(encoder, &reconfigure_params))) {
-      BOOST_LOG(warning) << "NvEnc: failed to reconfigure bitrate: " << last_nvenc_error_string;
-      return -1;
-    }
-
-    BOOST_LOG(info) << "NvEnc: bitrate reconfigured to " << new_bitrate_kbps << " kbps";
-    return 0;
+    // NvEncReconfigureEncoder MUST run on the same thread that calls
+    // EncodePicture / LockBitstream — NVIDIA Video Codec SDK
+    // Programming Guide §"Reconfiguring the Encoder Session" is
+    // explicit about the encoder being quiesced first. Apollo currently
+    // has no pending-reconfigure queue serviced from the encode thread,
+    // so any caller invoking this from the control or stats thread
+    // races EncodePicture and crashes the driver / hangs / removes the
+    // D3D11 device on RTX 30/40/50. Refusing here is safer than the
+    // 50–200ms reset path silently taking down the session.
+    BOOST_LOG(warning) << "NvEnc: update_bitrate refused — pending-reconfigure queue not implemented; "
+                          "request: " << new_bitrate_kbps << " kbps";
+    return -1;
   }
 
   int nvenc_base::update_resolution(int new_width, int new_height) {
@@ -642,6 +640,18 @@ namespace nvenc {
       return -1;
     }
 
+    // Same thread-safety constraint as update_bitrate (above): refuse
+    // the reconfigure rather than risk a driver crash. saved_init_params
+    // and saved_enc_config are also mutated here on success in the
+    // prior implementation; refusing avoids the partial-mutation
+    // divergence on failure that the audit flagged.
+    BOOST_LOG(warning) << "NvEnc: update_resolution refused — pending-reconfigure queue not implemented; "
+                          "request: " << new_width << "x" << new_height;
+    return -1;
+
+    // Original body kept unreached for reference once the pending-
+    // reconfigure queue is wired:
+#if 0
     NV_ENC_RECONFIGURE_PARAMS reconfigure_params = {min_struct_version(NV_ENC_RECONFIGURE_PARAMS_VER)};
     reconfigure_params.reInitEncodeParams = saved_init_params;
     reconfigure_params.reInitEncodeParams.encodeConfig = &saved_enc_config;
@@ -669,6 +679,7 @@ namespace nvenc {
 
     BOOST_LOG(info) << "NvEnc: resolution reconfigured to " << new_width << "x" << new_height;
     return 0;
+#endif
   }
 
   bool nvenc_base::nvenc_failed(NVENCSTATUS status) {

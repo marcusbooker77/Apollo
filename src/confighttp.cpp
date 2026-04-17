@@ -1161,7 +1161,7 @@ namespace confighttp {
         "max_pacing_buffer_ms",
         "thermal_step_down_resolution", "thermal_step_down_fps",
         "thermal_recovery_delay_s",
-        "smart_reconnect", "smart_reconnect_timeout_s",
+        "smart_reconnect", "smart_reconnect_timeout_s", "smart_reconnect_legacy_ip_match",
         "max_suspended_sessions",
         "wifi_quality_signaling", "wifi_preemptive_drop_threshold",
         // Audio
