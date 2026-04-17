@@ -273,6 +273,18 @@ namespace stream {
       }
     }
 
+    // Called by the encode thread AFTER it has actually applied the
+    // suggested step-down resolution. Decouples suggestion (read by the
+    // broadcast thread via get_thermal_resolution) from acknowledgement
+    // (write by the thread that knows the encoder reconfigured).
+    void ack_resolution_step_down() {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
+      if (!_resolution_stepped_down) {
+        _resolution_stepped_down = true;
+        _thermal_step_down_time = std::chrono::steady_clock::now();
+      }
+    }
+
   private:
     config_t _cfg;
 
@@ -430,18 +442,6 @@ namespace stream {
       // skipping the resolution step-down entirely. The acknowledgement
       // is now performed by ack_resolution_step_down() once the encode
       // thread has actually applied the new resolution.
-    }
-
-    // Called by the encode thread AFTER it has actually applied the
-    // suggested step-down resolution. Decouples suggestion (read by the
-    // broadcast thread via get_thermal_resolution) from acknowledgement
-    // (write by the thread that knows the encoder reconfigured).
-    void ack_resolution_step_down() {
-      std::lock_guard<std::recursive_mutex> lock(_mtx);
-      if (!_resolution_stepped_down) {
-        _resolution_stepped_down = true;
-        _thermal_step_down_time = std::chrono::steady_clock::now();
-      }
     }
   };
 

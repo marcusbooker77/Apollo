@@ -765,10 +765,12 @@ namespace nvhttp {
 
     auto args = request->parse_query_string();
     // Capture client IP up-front for per-IP OTP fail tracking (used in
-    // the OTP path below). The exact remote endpoint may live behind a
-    // socket type the request exposes via remote_endpoint_address(); we
-    // use it as the per-IP key.
-    const std::string client_ip = request->remote_endpoint_address();
+    // the OTP path below). remote_endpoint_address() is deprecated in
+    // the Simple-Web-Server version Apollo bundles; use
+    // remote_endpoint().address().to_string() which is the non-
+    // deprecated replacement.
+    const std::string client_ip =
+      request->remote_endpoint().address().to_string();
     if (args.find("uniqueid"s) == std::end(args)) {
       tree.put("root.<xmlattr>.status_code", 400);
       tree.put("root.<xmlattr>.status_message", "Missing uniqueid parameter");
