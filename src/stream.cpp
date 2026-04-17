@@ -463,15 +463,26 @@ namespace stream {
       //
       // The sequence number is 32 bits long which allows for 2^32 control stream messages
       // to be sent to each client before the IV repeats.
-      iv.resize(12);
-      std::copy_n((uint8_t *) &seq, sizeof(seq), std::begin(iv));
+      iv.assign(12, 0);  // zero-init: don't carry stale bytes between packets
+      // Write seq as 4 little-endian bytes explicitly, not via host-endian
+      // copy_n((uint8_t*)&seq, ...) which differs between LE/BE platforms.
+      iv[0] = (std::uint8_t)(seq & 0xFF);
+      iv[1] = (std::uint8_t)((seq >> 8) & 0xFF);
+      iv[2] = (std::uint8_t)((seq >> 16) & 0xFF);
+      iv[3] = (std::uint8_t)((seq >> 24) & 0xFF);
       iv[10] = 'H';  // Host originated
       iv[11] = 'C';  // Control stream
     } else {
-      // Nvidia's old style encryption uses a 16-byte IV
-      iv.resize(16);
-
-      iv[0] = (std::uint8_t) seq;
+      // Nvidia's old style encryption uses a 16-byte IV. Match the RX
+      // side's 4-byte big-endian construction (was 1 byte previously,
+      // causing IV reuse every 256 messages — XOR-recovery of the GCM
+      // key). Zero the IV first so leftover bytes from a prior packet
+      // can't survive into the unused 4..15 region.
+      iv.assign(16, 0);
+      iv[0] = (std::uint8_t)(seq >> 24);
+      iv[1] = (std::uint8_t)(seq >> 16);
+      iv[2] = (std::uint8_t)(seq >> 8);
+      iv[3] = (std::uint8_t)(seq & 0xFF);
     }
 
     auto packet = (control_encrypted_p) tagged_cipher.data();
@@ -812,7 +823,14 @@ namespace stream {
     auto elements = data_size / slice_size + (pad ? 1 : 0);
 
     auto required_size = elements * insert_size + data_size;
-    result.resize(required_size);
+    // assign(n, 0) instead of resize(): the caller passes `result` by
+    // reference for buffer reuse across frames. plain resize() leaves
+    // pre-existing bytes intact in the prepended `insert_size` header
+    // slots (this loop only fills the data sections after each header),
+    // so without zeroing, prior-frame plaintext (including H.264/HEVC
+    // NAL bytes from the previous video frame) leaks to the client
+    // through the reserved/padding fields of video_packet_raw_t.
+    result.assign(required_size, 0);
 
     auto next = std::begin(data1);
     auto end = std::end(data1);
@@ -1016,6 +1034,7 @@ namespace stream {
     }
 
     // Pack: encode_time(2) + bitrate(2) + fec_pct(1) + thermal(1) = 6 bytes
+#pragma pack(push, 1)
     struct {
       control_header_v2 header;
       uint16_t bitrate_kbps;
@@ -1023,6 +1042,7 @@ namespace stream {
       uint8_t fec_percentage;
       uint8_t thermal_state;
     } plaintext {};
+#pragma pack(pop)
 
     plaintext.header.type = 0x3004;  // Apollo server stats extension
     plaintext.header.payloadLength = sizeof(plaintext) - sizeof(control_header_v2);
@@ -1183,9 +1203,15 @@ namespace stream {
       BOOST_LOG(info) << "type [IDX_SET_CLIPBOARD]: size: " << payload.size();
 
       if (!(session->permission & crypto::PERM::clipboard_set)) {
-        BOOST_LOG(debug) << "Permission Clipboard Set deined for [" << session->device_name << "]";
+        BOOST_LOG(debug) << "Permission Clipboard Set denied for [" << session->device_name << "]";
         return;
       }
+
+      // Forward the payload to the platform clipboard. The previous
+      // commit removed this call along with a verbose log line; the log
+      // was the intended cleanup, the clipboard write was not. Without
+      // this the entire moonlight-fork clipboard feature is silently dead.
+      platf::set_clipboard(std::string{payload});
     });
 
     server->map(packetTypes[IDX_FILE_TRANSFER_NONCE_REQUEST], [server](session_t *session, const std::string_view &payload) {
@@ -1207,7 +1233,9 @@ namespace stream {
       }
       int quality = (int)(uint8_t)payload.data()[0];
       int rssi = (int)(int8_t)payload.data()[1];
-      int link_speed = util::endian::little(*(uint16_t *)(payload.data() + 2));
+      uint16_t link_speed_raw;
+      std::memcpy(&link_speed_raw, payload.data() + 2, sizeof(link_speed_raw));
+      int link_speed = util::endian::little(link_speed_raw);
 
       BOOST_LOG(verbose) << "WiFi quality: "sv << quality << " rssi: "sv << rssi << " link_speed: "sv << link_speed;
       session->bitrate_ctrl.on_wifi_quality(quality, rssi, link_speed);
@@ -1226,8 +1254,12 @@ namespace stream {
         return;
       }
 
-      auto length = util::endian::little(*(std::uint16_t *) payload.data());
-      auto seq = util::endian::little(*(std::uint32_t *) (payload.data() + sizeof(std::uint16_t)));
+      std::uint16_t length_raw;
+      std::uint32_t seq_raw;
+      std::memcpy(&length_raw, payload.data(), sizeof(length_raw));
+      std::memcpy(&seq_raw, payload.data() + sizeof(std::uint16_t), sizeof(seq_raw));
+      auto length = util::endian::little(length_raw);
+      auto seq = util::endian::little(seq_raw);
 
       if (length < (16 + 4 + 4)) {
         BOOST_LOG(warning) << "Control: Runt packet"sv;
@@ -1252,13 +1284,20 @@ namespace stream {
         //
         // The sequence number is 32 bits long which allows for 2^32 control stream messages
         // to be received from each client before the IV repeats.
-        iv.resize(12);
-        std::copy_n((uint8_t *) &seq, sizeof(seq), std::begin(iv));
+        iv.assign(12, 0);  // zero-init: matches TX side, no stale bytes
+        // Mirror the TX side's explicit little-endian write so the IV
+        // construction is identical across LE/BE platforms.
+        iv[0] = (std::uint8_t)(seq & 0xFF);
+        iv[1] = (std::uint8_t)((seq >> 8) & 0xFF);
+        iv[2] = (std::uint8_t)((seq >> 16) & 0xFF);
+        iv[3] = (std::uint8_t)((seq >> 24) & 0xFF);
         iv[10] = 'C';  // Client originated
         iv[11] = 'C';  // Control stream
       } else {
-        // Nvidia's old style encryption uses a 16-byte IV
-        iv.resize(16);
+        // Nvidia's old style encryption uses a 16-byte IV. Zero first
+        // (the vector is reused across packets, resize alone leaves
+        // bytes 4..15 as whatever the prior packet wrote).
+        iv.assign(16, 0);
 
         iv[0] = (std::uint8_t)(seq >> 24);
         iv[1] = (std::uint8_t)(seq >> 16);
@@ -1272,6 +1311,18 @@ namespace stream {
 
         BOOST_LOG(error) << "Failed to verify tag"sv;
 
+        session::stop(*session);
+        return;
+      }
+
+      // Reject undersized plaintext BEFORE the size_t subtraction below.
+      // A paired client (only party with the GCM tag key) could submit a
+      // valid-tagged 0-3 byte plaintext; the cast to uint16_t would read
+      // off the end and `plaintext.size() - 4` would underflow to ~SIZE_MAX,
+      // producing a multi-GB string_view passed to downstream handlers
+      // (IDX_INPUT_DATA, etc.) — controlled OOR read post-auth.
+      if (plaintext.size() < 4) {
+        BOOST_LOG(error) << "IDX_ENCRYPTED plaintext shorter than header (size="sv << plaintext.size() << ")"sv;
         session::stop(*session);
         return;
       }
@@ -1309,11 +1360,17 @@ namespace stream {
     while (!shutdown_event->peek() && !broadcast_shutdown_event->peek()) {
       bool has_session_awaiting_peer = false;
 
-      // Collect sessions needing I/O outside the lock to avoid holding mutex during network I/O
-      std::vector<session_t *> sessions_with_feedback;
-      std::vector<session_t *> sessions_with_hdr;
-      std::vector<session_t *> sessions_for_stats;
+      // We perform per-session I/O while holding _sessions.lock(). The
+      // earlier "collect raw session_t* and process outside the lock"
+      // pattern was a UAF: a concurrent stop/STOPPING transition could
+      // tear down the session between unlock and ENet send (sessions are
+      // raw pointers in _sessions, owned elsewhere — there's no
+      // shared_ptr we can clone to extend lifetime). The I/O calls below
+      // (send_feedback_msg / send_hdr_mode / send_server_stats) all hand
+      // the message to ENet, which queues; they don't perform synchronous
+      // network sends, so the longer lock hold is bounded.
 
+      const bool stats_due = (std::chrono::steady_clock::now() - last_stats_send) >= 1s;
       {
         auto lg = server->_sessions.lock();
 
@@ -1367,47 +1424,33 @@ namespace stream {
           if (!session->control.peer) {
             has_session_awaiting_peer = true;
           } else {
-            if (session->control.feedback_queue->peek()) {
-              sessions_with_feedback.push_back(session);
+            // Drain feedback / HDR queues here under the sessions lock —
+            // the session and its peer cannot be torn down concurrently
+            // because STOPPING is the only path that erases from
+            // _sessions, and that path runs in this same loop.
+            auto &feedback_queue = session->control.feedback_queue;
+            while (feedback_queue->peek()) {
+              auto feedback_msg = feedback_queue->pop();
+              send_feedback_msg(session, *feedback_msg);
             }
-            if (session->control.hdr_queue->peek()) {
-              sessions_with_hdr.push_back(session);
+            auto &hdr_queue = session->control.hdr_queue;
+            while (session->control.peer && hdr_queue->peek()) {
+              auto hdr_info = hdr_queue->pop();
+              send_hdr_mode(session, std::move(hdr_info));
             }
-            // Collect running sessions for periodic stats
-            if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING) {
-              sessions_for_stats.push_back(session);
+            // Periodic stats: only emit on RUNNING sessions, gated on
+            // the 1s timer (computed once below per loop iteration).
+            if (session->state.load(std::memory_order_acquire) == session::state_e::RUNNING &&
+                stats_due) {
+              send_server_stats(session);
             }
           }
 
           ++pos;
         })
       }
-
-      // Process network I/O outside the critical section
-      for (auto &session : sessions_with_feedback) {
-        auto &feedback_queue = session->control.feedback_queue;
-        while (feedback_queue->peek()) {
-          auto feedback_msg = feedback_queue->pop();
-          send_feedback_msg(session, *feedback_msg);
-        }
-      }
-      for (auto &session : sessions_with_hdr) {
-        auto &hdr_queue = session->control.hdr_queue;
-        while (session->control.peer && hdr_queue->peek()) {
-          auto hdr_info = hdr_queue->pop();
-          send_hdr_mode(session, std::move(hdr_info));
-        }
-      }
-
-      // Feature 4: Send server stats periodically (~1 second interval)
-      {
-        auto stats_now = std::chrono::steady_clock::now();
-        if (stats_now - last_stats_send >= 1s) {
-          for (auto &session : sessions_for_stats) {
-            send_server_stats(session);
-          }
-          last_stats_send = stats_now;
-        }
+      if (stats_due) {
+        last_stats_send = std::chrono::steady_clock::now();
       }
 
       // Don't break until any pending sessions either expire or connect
@@ -1603,6 +1646,13 @@ namespace stream {
         auto thermal_res = session->bitrate_ctrl.get_thermal_resolution();
         if (thermal_res > 0) {
           BOOST_LOG(warning) << "Thermal protection: suggesting resolution step-down to "sv << thermal_res << "p"sv;
+          // Ack the suggestion so the FPS step-down path (which is gated
+          // on _resolution_stepped_down) can fire once 10s have elapsed.
+          // Strictly this should only happen after the encoder has
+          // actually reconfigured — see Critical #7 in MASTER_REVIEW.md.
+          // Until adaptive bitrate is wired through, an ack-on-log keeps
+          // the prior behavior of the FPS branch.
+          session->bitrate_ctrl.ack_resolution_step_down();
         }
         auto thermal_fps = session->bitrate_ctrl.get_thermal_fps();
         if (thermal_fps > 0) {

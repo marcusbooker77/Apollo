@@ -1133,23 +1133,53 @@ namespace confighttp {
         "adapter_name", "output_name", "resolutions", "fps",
         // Network / UPnP
         "upnp", "address_family", "port",
+        "lan_encryption_mode", "wan_encryption_mode",
         // Input settings
         "back_button_timeout", "key_repeat_delay", "key_repeat_period",
         "always_send_scancodes", "key_rightalt_to_key_win",
         "gamepad", "ds4_back_as_touchpad_click", "motion_as_ds4",
         "touchpad_as_ds4",
+        // Pairing / discovery / tray
+        "enable_pairing", "pin_required",
+        "enable_discovery",
+        "enable_tray", "tray_hide_control_options",
         // Display settings
         "notify_pre_releases",
+        // Capture settings
+        "capture", "dd_hdr_option",
+        // Command preparations
+        "global_prep_cmd", "server_cmd",
+        // Adaptive streaming
+        "adaptive_bitrate", "adaptive_fec", "frame_pacing",
+        "thermal_protection", "max_bitrate_adaptive",
+        "min_fec_percentage", "max_fec_percentage",
+        "max_pacing_buffer_ms",
+        "thermal_step_down_resolution", "thermal_step_down_fps",
+        "thermal_recovery_delay_s",
+        "smart_reconnect", "smart_reconnect_timeout_s",
+        "max_suspended_sessions",
+        "wifi_quality_signaling", "wifi_preemptive_drop_threshold",
+        // Audio
+        "audio_codec", "lossless",
+        // Telemetry
+        "metrics",
       };
       std::stringstream config_stream;
       nlohmann::json output_tree;
       nlohmann::json input_tree = nlohmann::json::parse(ss);
+      // Surface rejected keys to the UI instead of silently dropping them.
+      // The UI was previously writing values that fell outside this list
+      // (notably the new pin_required / adaptive-streaming toggles before
+      // they were added) and the only signal was a server-side log. The
+      // rejected_keys array in the response lets the UI flag bad calls.
+      nlohmann::json rejected_keys = nlohmann::json::array();
       for (const auto &[k, v] : input_tree.items()) {
         if (v.is_null() || (v.is_string() && v.get<std::string>().empty())) {
           continue;
         }
         if (!allowed_keys.count(k)) {
           BOOST_LOG(warning) << "Rejected config key not in allowlist: " << k;
+          rejected_keys.push_back(k);
           continue;
         }
 
@@ -1168,6 +1198,9 @@ namespace confighttp {
       }
       file_handler::write_file(config::sunshine.config_file.c_str(), config_stream.str());
       output_tree["status"] = true;
+      if (!rejected_keys.empty()) {
+        output_tree["rejected_keys"] = rejected_keys;
+      }
       send_response(response, output_tree);
     } catch (std::exception &e) {
       BOOST_LOG(warning) << "SaveConfig: "sv << e.what();

@@ -80,47 +80,49 @@ namespace stream {
 
       // Adaptive bitrate adjustment
       if (_cfg.adaptive_bitrate) {
+        int target = _target_bitrate_kbps.load();
         if (loss_rate > 0.05f) {
           // Heavy loss: drop 30%
-          _target_bitrate_kbps = static_cast<int>(_target_bitrate_kbps * 0.7f);
-          _target_bitrate_kbps = std::max(_target_bitrate_kbps, _cfg.min_bitrate_kbps);
+          target = static_cast<int>(target * 0.7f);
+          target = std::max(target, _cfg.min_bitrate_kbps);
         }
         else if (loss_rate > 0.01f) {
           // Moderate loss: drop 10%
-          _target_bitrate_kbps = static_cast<int>(_target_bitrate_kbps * 0.9f);
-          _target_bitrate_kbps = std::max(_target_bitrate_kbps, _cfg.min_bitrate_kbps);
+          target = static_cast<int>(target * 0.9f);
+          target = std::max(target, _cfg.min_bitrate_kbps);
         }
         else if (loss_rate == 0.0f) {
           auto zero_duration = std::chrono::duration_cast<std::chrono::seconds>(now - _last_zero_loss_time);
           if (zero_duration.count() >= 3) {
             // No loss for 3+ seconds: ramp up 10%
-            _target_bitrate_kbps = static_cast<int>(_target_bitrate_kbps * 1.1f);
-            _target_bitrate_kbps = std::min(_target_bitrate_kbps, _cfg.max_bitrate_kbps);
+            target = static_cast<int>(target * 1.1f);
+            target = std::min(target, _cfg.max_bitrate_kbps);
           }
         }
-
-        _current_bitrate_kbps = _target_bitrate_kbps;
+        _target_bitrate_kbps.store(target);
+        _current_bitrate_kbps.store(target);
       }
 
       // Update loss EMA for FEC
       if (_cfg.adaptive_fec) {
-        _loss_ema = 0.3f * loss_rate + 0.7f * _loss_ema;
+        float ema = 0.3f * loss_rate + 0.7f * _loss_ema.load();
+        _loss_ema.store(ema);
 
         // FEC percentage based on EMA thresholds
-        if (_loss_ema > 0.10f) {
-          _fec_percentage = _cfg.max_fec_percentage;
+        if (ema > 0.10f) {
+          _fec_percentage.store(_cfg.max_fec_percentage);
         }
-        else if (_loss_ema > 0.05f) {
-          _fec_percentage = _cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) * 3 / 4;
+        else if (ema > 0.05f) {
+          _fec_percentage.store(_cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) * 3 / 4);
         }
-        else if (_loss_ema > 0.02f) {
-          _fec_percentage = _cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) / 2;
+        else if (ema > 0.02f) {
+          _fec_percentage.store(_cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) / 2);
         }
-        else if (_loss_ema > 0.005f) {
-          _fec_percentage = _cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) / 4;
+        else if (ema > 0.005f) {
+          _fec_percentage.store(_cfg.min_fec_percentage + (_cfg.max_fec_percentage - _cfg.min_fec_percentage) / 4);
         }
         else {
-          _fec_percentage = _cfg.min_fec_percentage;
+          _fec_percentage.store(_cfg.min_fec_percentage);
         }
       }
 
@@ -152,8 +154,8 @@ namespace stream {
       (void) link_speed_mbps;
 
       auto now = std::chrono::steady_clock::now();
-      _prev_wifi_quality = _wifi_quality;
-      _wifi_quality = quality;
+      _prev_wifi_quality.store(_wifi_quality.load());
+      _wifi_quality.store(quality);
 
       // Check for rapid quality tier drop
       auto time_since_last = std::chrono::duration_cast<std::chrono::seconds>(now - _wifi_quality_time);
@@ -232,9 +234,9 @@ namespace stream {
   private:
     config_t _cfg;
 
-    // Bitrate state
-    int _current_bitrate_kbps = 20000;
-    int _target_bitrate_kbps = 20000;
+    // Bitrate state (read from video send thread, written from control thread)
+    std::atomic<int> _current_bitrate_kbps{20000};
+    std::atomic<int> _target_bitrate_kbps{20000};
 
     // Loss tracking (rolling 2-second window)
     static constexpr int LOSS_WINDOW_SIZE = 20;
@@ -249,9 +251,9 @@ namespace stream {
     std::chrono::steady_clock::time_point _last_loss_time;
     std::chrono::steady_clock::time_point _last_zero_loss_time;
 
-    // FEC state
-    float _loss_ema = 0.0f;
-    int _fec_percentage = 20;
+    // FEC state (read from video send thread, written from control thread)
+    std::atomic<float> _loss_ema{0.0f};
+    std::atomic<int> _fec_percentage{20};
 
     // Frame pacing state
     static constexpr int JITTER_WINDOW_SIZE = 30;
@@ -260,20 +262,20 @@ namespace stream {
     int _jitter_count = 0;
     int _pacing_buffer_us = 0;
 
-    // Thermal state
-    int _idr_requests_last_minute = 0;
+    // Thermal state (read cross-thread)
+    std::atomic<int> _idr_requests_last_minute{0};
     std::chrono::steady_clock::time_point _idr_minute_start;
-    int _thermal_state = 0;
+    std::atomic<int> _thermal_state{0};
     std::chrono::steady_clock::time_point _thermal_step_down_time;
     std::chrono::steady_clock::time_point _thermal_last_change;
     bool _resolution_stepped_down = false;
     bool _fps_stepped_down = false;
 
-    // WiFi quality (from custom client)
-    int _wifi_quality = 4;
-    int _prev_wifi_quality = 4;
+    // WiFi quality (from custom client, read cross-thread)
+    std::atomic<int> _wifi_quality{4};
+    std::atomic<int> _prev_wifi_quality{4};
     std::chrono::steady_clock::time_point _wifi_quality_time;
-    bool _wifi_preemptive_active = false;
+    std::atomic<bool> _wifi_preemptive_active{false};
 
     float compute_loss_rate() const {
       if (_loss_window_count == 0) {
@@ -329,29 +331,28 @@ namespace stream {
       // Reset IDR counter if minute elapsed
       auto idr_elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - _idr_minute_start);
       if (idr_elapsed.count() >= 60) {
-        _idr_requests_last_minute = 0;
+        _idr_requests_last_minute.store(0);
         _idr_minute_start = now;
       }
 
-      bool idr_hot = _idr_requests_last_minute > 5;
-      bool loss_trending_up = _loss_ema > 0.02f;
+      bool idr_hot = _idr_requests_last_minute.load() > 5;
+      bool loss_trending_up = _loss_ema.load() > 0.02f;
 
-      int prev_state = _thermal_state;
+      int state = _thermal_state.load();
+      int prev_state = state;
 
       if (idr_hot && loss_trending_up) {
-        // Both signals: move toward hot
-        if (_thermal_state < 2) {
-          _thermal_state++;
+        if (state < 2) {
+          state++;
           _thermal_last_change = now;
-          if (_thermal_state == 2) {
+          if (state == 2) {
             _thermal_step_down_time = now;
           }
         }
       }
       else if (idr_hot || loss_trending_up) {
-        // One signal: at least warm
-        if (_thermal_state < 1) {
-          _thermal_state = 1;
+        if (state < 1) {
+          state = 1;
           _thermal_last_change = now;
         }
       }
@@ -359,32 +360,44 @@ namespace stream {
       // Recovery: if stable for recovery_delay, step back down
       auto since_change = std::chrono::duration_cast<std::chrono::seconds>(now - _thermal_last_change);
       if (!idr_hot && !loss_trending_up && since_change.count() >= _cfg.thermal_recovery_delay_s) {
-        if (_thermal_state > 0) {
-          _thermal_state--;
+        if (state > 0) {
+          state--;
           _thermal_last_change = now;
 
-          if (_thermal_state < 2) {
+          if (state < 2) {
             _fps_stepped_down = false;
           }
-          if (_thermal_state == 0) {
+          if (state == 0) {
             _resolution_stepped_down = false;
           }
         }
       }
 
+      _thermal_state.store(state);
+
       // Track step-down state transitions
-      if (_thermal_state >= 2 && prev_state < 2) {
+      if (state >= 2 && prev_state < 2) {
         _resolution_stepped_down = false;
         _fps_stepped_down = false;
       }
 
-      // Mark resolution as stepped down if it was requested
-      if (_thermal_state >= 2 && !_resolution_stepped_down) {
-        // The caller will read get_thermal_resolution() and apply it,
-        // then should set _resolution_stepped_down via the step-down acknowledgment.
-        // For simplicity, we mark it on the next update cycle after the state hits 2.
+      // NOTE: do NOT mark _resolution_stepped_down here. The flag is the
+      // "ack" that get_thermal_resolution()'s suggestion was applied —
+      // setting it inside the same call cycle that suggests the change
+      // means get_thermal_resolution() returns 0 on the very next call,
+      // skipping the resolution step-down entirely. The acknowledgement
+      // is now performed by ack_resolution_step_down() once the encode
+      // thread has actually applied the new resolution.
+    }
+
+    // Called by the encode thread AFTER it has actually applied the
+    // suggested step-down resolution. Decouples suggestion (read by the
+    // broadcast thread via get_thermal_resolution) from acknowledgement
+    // (write by the thread that knows the encoder reconfigured).
+    void ack_resolution_step_down() {
+      if (!_resolution_stepped_down) {
         _resolution_stepped_down = true;
-        _thermal_step_down_time = now;
+        _thermal_step_down_time = std::chrono::steady_clock::now();
       }
     }
   };

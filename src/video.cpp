@@ -1520,9 +1520,13 @@ namespace video {
       return encode_avcodec(frame_nr, static_cast<avcodec_encode_session_t &>(session), packets, channel_data, frame_timestamp);
     case encoder_type_e::NVENC:
       return encode_nvenc(frame_nr, static_cast<nvenc_encode_session_t &>(session), packets, channel_data, frame_timestamp);
+    case encoder_type_e::UNKNOWN:
+    default:
+      // Subclass forgot to set encoder_type. Refuse rather than reading
+      // garbage off the stack and static_cast'ing to the wrong subclass.
+      BOOST_LOG(error) << "encode_session_t::encoder_type uninitialised — encoder subclass bug"sv;
+      return -1;
     }
-
-    return -1;
   }
 
   std::unique_ptr<avcodec_encode_session_t> make_avcodec_encode_session(

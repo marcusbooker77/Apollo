@@ -204,6 +204,8 @@ namespace video {
   };
 
   enum class encoder_type_e {
+    UNKNOWN = 0,  // sentinel for default-initialised base; switch dispatch
+                  // checks for this and aborts rather than reading garbage
     AVCODEC,
     NVENC,
   };
@@ -238,7 +240,9 @@ namespace video {
       return -1;
     }
 
-    encoder_type_e encoder_type;
+    // Default-init to UNKNOWN so a subclass that forgets to set this
+    // doesn't read garbage in the dispatch switch in video.cpp.
+    encoder_type_e encoder_type = encoder_type_e::UNKNOWN;
   };
 
   // encoders
