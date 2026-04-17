@@ -841,12 +841,22 @@ namespace nvhttp {
         }
 
         if (!config::sunshine.pin_required) {
-          // PIN requirement disabled — use a fixed known PIN "0000"
-          // The client must also use "0000" as the PIN for the handshake to succeed.
-          // Moonlight clients show a random PIN — user must type "0000" instead.
-          // This skips the server-side prompt entirely.
-          BOOST_LOG(info) << "PIN requirement disabled — auto-accepting pairing for device: "
-                          << ptr->second.client.name << " (fixed PIN: 0000)";
+          // PIN requirement disabled — auto-accept with fixed PIN "0000".
+          // Hard refusal when UPnP is on: the server is reachable from
+          // the public internet and "anyone who can reach the port can
+          // pair" is not an acceptable shape. The user must explicitly
+          // turn UPnP off before this toggle takes effect.
+          if (config::sunshine.flags[config::flag::UPNP]) {
+            BOOST_LOG(warning) << "Refusing pin_required=false pair attempt while UPnP is enabled "
+                                  "(device='" << ptr->second.client.name
+                               << "'). Turn UPnP off if you really want skip-PIN pairing.";
+            tree.put("root.paired", 0);
+            tree.put("root.<xmlattr>.status_code", 503);
+            tree.put("root.<xmlattr>.status_message", "Skip-PIN pairing disabled while UPnP is on");
+            return;
+          }
+          BOOST_LOG(warning) << "PIN requirement disabled — auto-accepting pairing for device: "
+                             << ptr->second.client.name << " (fixed PIN: 0000)";
           getservercert(ptr->second, tree, "0000");
         } else if (config::sunshine.flags[config::flag::PIN_STDIN]) {
           std::string pin;

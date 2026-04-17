@@ -211,6 +211,11 @@ namespace confighttp {
     // Check for expiry
     if (std::chrono::steady_clock::now() - cookie_creation_time > SESSION_EXPIRE_DURATION) {
       sessionCookie.clear();
+      // Clear the CSRF token alongside the session cookie. Without this,
+      // a token issued under the previous session survives into the next
+      // user's session and can be replayed against authenticated endpoints
+      // until the next privileged action rotates it.
+      csrfToken.clear();
       return false;
     }
     auto cookies = request->header.find("cookie");
@@ -1610,7 +1615,15 @@ namespace confighttp {
       output_tree["csrf_token"] = csrfToken;
     }
     output_tree["status"] = true;
-    send_response(response, output_tree);
+    // Don't let upstream proxies, browser disk caches, or service workers
+    // hold the CSRF token. Without no-store, an attacker with a stolen
+    // auth cookie can pull the token from cached responses for the
+    // duration of the cache lifetime even after we rotate it.
+    SimpleWeb::CaseInsensitiveMultimap headers;
+    headers.emplace("Cache-Control", "no-store, private");
+    headers.emplace("Pragma", "no-cache");
+    headers.emplace("Content-Type", "application/json");
+    response->write(SimpleWeb::StatusCode::success_ok, output_tree.dump(), headers);
   }
 
   /**

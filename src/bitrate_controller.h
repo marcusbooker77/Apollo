@@ -8,9 +8,27 @@
 #include <cmath>
 #include <algorithm>
 #include <atomic>
+#include <mutex>
 
 namespace stream {
 
+  // bitrate_controller_t is touched from at least three threads in
+  // Apollo's streaming path: the control thread (on_loss_stats /
+  // on_idr_request / on_wifi_quality), the video broadcast thread
+  // (record_frame_interval / get_pacing_buffer_us / get_thermal_*),
+  // and a stats thread. The original implementation declared a few
+  // scalars std::atomic but left _loss_window[], _jitter_window[],
+  // their indices/counts, and the thermal time_points as plain
+  // members — textbook data race (UB under TSan), with torn 64-bit
+  // time_point reads on ARM/MSVC and possible infinite loops in
+  // compute_loss_rate when _loss_window_count is observed past its
+  // initialised value.
+  //
+  // Rather than convert every field to atomics with CAS loops (which
+  // would still leave the windowed-array reads racy), the class now
+  // takes a single recursive_mutex around all public methods. The
+  // path is not hot relative to encode/network — sub-millisecond
+  // serialisation cost is acceptable.
   class bitrate_controller_t {
   public:
     struct config_t {
@@ -29,7 +47,13 @@ namespace stream {
       int wifi_preemptive_drop_threshold = 2;
     };
 
+    // Single recursive mutex guarding all public methods. update_thermal
+    // (called from on_loss_stats while it holds the lock) and the ack
+    // path are reentrant, hence recursive_mutex.
+    mutable std::recursive_mutex _mtx;
+
     void init(int initial_bitrate_kbps, config_t cfg) {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       _cfg = cfg;
       _current_bitrate_kbps = initial_bitrate_kbps;
       _target_bitrate_kbps = initial_bitrate_kbps;
@@ -54,6 +78,7 @@ namespace stream {
     }
 
     void on_loss_stats(int packets_sent, int packets_lost) {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (!_cfg.adaptive_bitrate && !_cfg.adaptive_fec) {
         return;
       }
@@ -133,6 +158,7 @@ namespace stream {
     }
 
     void on_idr_request() {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (!_cfg.thermal_protection) {
         return;
       }
@@ -150,6 +176,7 @@ namespace stream {
     }
 
     void on_wifi_quality(int quality, int rssi, int link_speed_mbps) {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       (void) rssi;
       (void) link_speed_mbps;
 
@@ -172,6 +199,7 @@ namespace stream {
     }
 
     int get_target_bitrate_kbps() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       int bitrate = _target_bitrate_kbps;
 
       // Apply WiFi preemptive drop
@@ -184,10 +212,12 @@ namespace stream {
     }
 
     int get_fec_percentage() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       return _fec_percentage;
     }
 
     int get_pacing_buffer_us() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (!_cfg.frame_pacing || _jitter_count < 2) {
         return 0;
       }
@@ -202,10 +232,12 @@ namespace stream {
     }
 
     int get_thermal_state() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       return _thermal_state;
     }
 
     int get_thermal_resolution() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (_thermal_state >= 2 && !_resolution_stepped_down) {
         return _cfg.thermal_step_down_resolution;
       }
@@ -213,6 +245,7 @@ namespace stream {
     }
 
     int get_thermal_fps() const {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (_thermal_state >= 2 && _resolution_stepped_down) {
         auto now = std::chrono::steady_clock::now();
         auto since_step = std::chrono::duration_cast<std::chrono::seconds>(now - _thermal_step_down_time);
@@ -224,6 +257,7 @@ namespace stream {
     }
 
     void record_frame_interval(std::chrono::microseconds interval) {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       _jitter_window[_jitter_idx] = interval;
       _jitter_idx = (_jitter_idx + 1) % JITTER_WINDOW_SIZE;
       if (_jitter_count < JITTER_WINDOW_SIZE) {
@@ -395,6 +429,7 @@ namespace stream {
     // broadcast thread via get_thermal_resolution) from acknowledgement
     // (write by the thread that knows the encoder reconfigured).
     void ack_resolution_step_down() {
+      std::lock_guard<std::recursive_mutex> lock(_mtx);
       if (!_resolution_stepped_down) {
         _resolution_stepped_down = true;
         _thermal_step_down_time = std::chrono::steady_clock::now();
