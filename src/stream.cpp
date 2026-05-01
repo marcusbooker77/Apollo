@@ -1292,11 +1292,23 @@ namespace stream {
       }
 
       auto tagged_cipher_length = length - 4;
-      if ((size_t) tagged_cipher_length > payload.size() - hdr_size) {
+      // Overflow-safe size validation: avoids underflow in the original
+      // `payload.size() - hdr_size` expression and guards against the
+      // `cipher_len + hdr_size` addition wrapping size_t.
+      if (tagged_cipher_length < 0) {
+        BOOST_LOG(warning) << "Control: Negative encrypted payload length"sv;
+        return;
+      }
+      const size_t cipher_len = (size_t) tagged_cipher_length;
+      if (cipher_len > SIZE_MAX - hdr_size) {
+        BOOST_LOG(warning) << "Control: Encrypted payload length overflow"sv;
+        return;
+      }
+      if (cipher_len + hdr_size > payload.size()) {
         BOOST_LOG(warning) << "Control: Encrypted payload length exceeds buffer"sv;
         return;
       }
-      std::string_view tagged_cipher {payload.data() + hdr_size, (size_t) tagged_cipher_length};
+      std::string_view tagged_cipher {payload.data() + hdr_size, cipher_len};
 
       auto &cipher = session->control.cipher;
       auto &iv = session->control.incoming_iv;

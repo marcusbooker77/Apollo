@@ -1,5 +1,22 @@
 # Apollo Security & Performance Hardening Changelog
 
+## Round 2 — Tier A/B/C/H + Adaptive Suite (commits a09a2bb..861df50)
+
+Second wave of hardening on top of the original 61-fix Round 1 baseline.
+Each commit below is summarised in a single line; refer to the commit message
+for the full per-fix breakdown.
+
+- `f8d38fa` — Tier A: surgical fixes from cross-agent review (highest-confidence security/correctness items only)
+- `8417502` — Tier B: defence-in-depth and lower-confidence Tier A spillover
+- `947fb81` — Tier C: cleanups, comments, and low-risk hardening
+- `b3c0467` — Consensus-high: PBKDF2-HMAC-SHA256 600k-iteration password hashing (replaces Round 1's iterated-SHA-256, see entry #16 below)
+- `464059b` — Adaptive streaming: bitrate controller, FEC adaptation, frame pacing, thermal protection, WiFi-quality preemption
+- `12e5fd1` — CSRF: refinements and origin-check tightening on top of Round 1's CSRF token system
+- `78d7162` + `7707a80` — `pin_required` enforcement for pairing flow
+- `861df50` — Build fixes required to make the Round 2 stack compile cleanly across MSVC / Clang / MinGW
+
+---
+
 ## Overview
 
 This document details 61 security and performance fixes applied across 4 commits to the Apollo/Sunshine game streaming server. Changes were identified through 8 parallel code review passes:
@@ -48,7 +65,7 @@ This document details 61 security and performance fixes applied across 4 commits
 |---|-----|---------|
 | 14 | Per-IP login rate limiting replacing global counter | confighttp.cpp |
 | 15 | Pairing session limit of 10 concurrent sessions | nvhttp.cpp |
-| 16 | Iterated SHA-256 (100k rounds) password hashing with version migration | httpcommon.cpp, httpcommon.h, config.h |
+| 16 | PBKDF2-HMAC-SHA256 password hashing (600k iterations, per OWASP 2023) with version migration — superseded the Round 1 iterated-SHA-256 (100k) implementation in commit `b3c0467` | httpcommon.cpp, httpcommon.h, config.h |
 | 17 | Welcome page requires IP origin check | confighttp.cpp |
 | 18 | Reject newlines in config values — prevents config injection | confighttp.cpp |
 | 19 | Check sscanf return value in UUID parser | uuid.h |

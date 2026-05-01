@@ -19,11 +19,15 @@ namespace uuid_util {
     std::uint64_t b64[2];
 
     static uuid_t generate(std::default_random_engine &engine) {
-      std::uniform_int_distribution<std::uint8_t> dist(0, std::numeric_limits<std::uint8_t>::max());
+      // Per [rand.req.genl] only short/int/long/long long (and unsigned variants)
+      // are valid template args for uniform_int_distribution; uint8_t is UB on
+      // some standard libraries. Use unsigned int with explicit [0,255] bounds
+      // and narrow at the call site.
+      std::uniform_int_distribution<unsigned int> dist(0, 255);
 
       uuid_t buf;
       for (auto &el : buf.b8) {
-        el = dist(engine);
+        el = static_cast<std::uint8_t>(dist(engine));
       }
 
       buf.b8[7] &= (std::uint8_t) 0b00101111;

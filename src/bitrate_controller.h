@@ -83,6 +83,11 @@ namespace stream {
       _last_loss_time = std::chrono::steady_clock::now();
       _last_zero_loss_time = std::chrono::steady_clock::now();
       _thermal_last_change = std::chrono::steady_clock::now();
+      _thermal_step_down_time = std::chrono::steady_clock::now();
+      _last_bitrate_change = std::chrono::steady_clock::now();
+      _low_loss_streak = 0;
+      /* default-constructed time_point would equal epoch and break threshold comparisons after a refactor — initialize to "now" so the first call returns sensible elapsed-time. */
+      _wifi_quality_time = std::chrono::steady_clock::now();
     }
 
     void on_loss_stats(int packets_sent, int packets_lost) {
@@ -111,26 +116,69 @@ namespace stream {
         _last_zero_loss_time = now;
       }
 
-      // Adaptive bitrate adjustment
+      // Adaptive bitrate adjustment with hysteresis.
+      //
+      // Original logic raised on loss==0 and lowered on loss>0.01. Because the
+      // raise and lower thresholds were a single point each, a borderline link
+      // hovering around ~1% loss would oscillate every sample period: drop 10%,
+      // observe zero loss for 3s, raise 10%, hit loss again, drop, repeat.
+      // Two-sided hysteresis fixes this:
+      //   * lower_loss_threshold_high (0.05f)  — heavy-loss step-down
+      //   * lower_loss_threshold     (0.01f)   — moderate step-down
+      //   * raise_loss_threshold     (0.005f)  — must be BELOW lower threshold
+      //                                          before a raise is even considered
+      //   * MIN_LOW_LOSS_STREAK (3 samples)    — consecutive low-loss samples
+      //                                          required to confirm the link
+      //                                          stabilised before raising
+      //   * MIN_DWELL_S (2s)                   — minimum time between any two
+      //                                          bitrate changes; refuses faster
+      //                                          oscillation regardless of loss
+      // The dwell timer guarantees we settle for at least 2s after any change
+      // even if the streak counter says "raise now".
       if (_cfg.adaptive_bitrate) {
+        constexpr float raise_loss_threshold = 0.005f;
+        constexpr int   MIN_LOW_LOSS_STREAK = 3;
+        constexpr int   MIN_DWELL_S = 2;
+
         int target = _target_bitrate_kbps.load();
+        const int prev_target = target;
+
+        auto since_last_change = std::chrono::duration_cast<std::chrono::seconds>(now - _last_bitrate_change);
+        const bool dwell_ok = since_last_change.count() >= MIN_DWELL_S;
+
+        if (loss_rate >= raise_loss_threshold) {
+          // any non-trivial loss resets the raise streak
+          _low_loss_streak = 0;
+        }
+        else {
+          if (_low_loss_streak < std::numeric_limits<int>::max()) {
+            _low_loss_streak++;
+          }
+        }
+
         if (loss_rate > 0.05f) {
-          // Heavy loss: drop 30%
+          // Heavy loss: drop 30% (always honoured — protect link)
           target = static_cast<int>(target * 0.7f);
           target = std::max(target, _cfg.min_bitrate_kbps);
         }
-        else if (loss_rate > 0.01f) {
-          // Moderate loss: drop 10%
+        else if (loss_rate > 0.01f && dwell_ok) {
+          // Moderate loss: drop 10% (gated by dwell to avoid double-step)
           target = static_cast<int>(target * 0.9f);
           target = std::max(target, _cfg.min_bitrate_kbps);
         }
-        else if (loss_rate == 0.0f) {
+        else if (loss_rate < raise_loss_threshold && dwell_ok && _low_loss_streak >= MIN_LOW_LOSS_STREAK) {
           auto zero_duration = std::chrono::duration_cast<std::chrono::seconds>(now - _last_zero_loss_time);
           if (zero_duration.count() >= 3) {
-            // No loss for 3+ seconds: ramp up 10%
+            // No (or sub-threshold) loss for 3+ seconds AND dwell satisfied
+            // AND streak confirms stability: ramp up 10%.
             target = static_cast<int>(target * 1.1f);
             target = std::min(target, _cfg.max_bitrate_kbps);
           }
+        }
+
+        if (target != prev_target) {
+          _last_bitrate_change = now;
+          _low_loss_streak = 0;  // reset streak on any change so a raise immediately after a drop must re-prove stability
         }
         _target_bitrate_kbps.store(target);
         _current_bitrate_kbps.store(target);
@@ -308,6 +356,13 @@ namespace stream {
     // FEC state (read from video send thread, written from control thread)
     std::atomic<float> _loss_ema{0.0f};
     std::atomic<int> _fec_percentage{20};
+
+    // Adaptive-bitrate hysteresis state. _last_bitrate_change throttles how
+    // often the target can move (dwell timer); _low_loss_streak counts
+    // consecutive low-loss samples before a raise is allowed. Both are
+    // protected by _mtx (only touched inside on_loss_stats / init).
+    std::chrono::steady_clock::time_point _last_bitrate_change;
+    int _low_loss_streak = 0;
 
     // Frame pacing state
     static constexpr int JITTER_WINDOW_SIZE = 30;
