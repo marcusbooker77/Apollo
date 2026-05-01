@@ -12,6 +12,7 @@
 #include <physicalmonitorenumerationapi.h>
 #include <dxgi1_6.h>
 
+#include "src/logging.h"
 #include "virtual_display.h"
 
 using namespace SUDOVDA;
@@ -21,6 +22,88 @@ namespace VDISPLAY {
 // static const GUID DEFAULT_DISPLAY_GUID = { 0xdff7fd29, 0x5b75, 0x41d1, { 0x97, 0x31, 0xb3, 0x2a, 0x17, 0xa1, 0x71, 0x04 } };
 
 HANDLE SUDOVDA_DRIVER_HANDLE = INVALID_HANDLE_VALUE;
+
+// ----------------------------------------------------------------------------
+// display_topology_snapshot_t — RAII capture/restore of the active display
+// topology. Captures via QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS) at construction
+// and restores in the destructor. Restoration uses SDC_USE_SUPPLIED_DISPLAY_CONFIG
+// so we replay the *exact* topology the user had (extend / clone / internal-only),
+// avoiding the bug where blanket SDC_TOPOLOGY_EXTEND would force an EXTEND layout
+// even on systems that were originally in clone or internal-only mode.
+// SDC_SAVE_TO_DATABASE is intentionally included so the restored layout persists
+// across reboots, matching how Apollo's other apply paths already behave.
+// ----------------------------------------------------------------------------
+display_topology_snapshot_t::display_topology_snapshot_t() {
+	UINT32 pathCount = 0;
+	UINT32 modeCount = 0;
+	LONG sizesStatus = GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount);
+	if (sizesStatus != ERROR_SUCCESS) {
+		BOOST_LOG(warning) << "[SUDOVDA] display_topology_snapshot: GetDisplayConfigBufferSizes failed (status=" << sizesStatus << "); topology will not be restored on exit.";
+		return;
+	}
+
+	_paths.assign(pathCount, DISPLAYCONFIG_PATH_INFO {});
+	_modes.assign(modeCount, DISPLAYCONFIG_MODE_INFO {});
+
+	LONG queryStatus = QueryDisplayConfig(
+		QDC_ONLY_ACTIVE_PATHS,
+		&pathCount,
+		_paths.data(),
+		&modeCount,
+		_modes.data(),
+		nullptr
+	);
+	if (queryStatus != ERROR_SUCCESS) {
+		BOOST_LOG(warning) << "[SUDOVDA] display_topology_snapshot: QueryDisplayConfig failed (status=" << queryStatus << "); topology will not be restored on exit.";
+		_paths.clear();
+		_modes.clear();
+		return;
+	}
+
+	// Trim to the actual returned counts (the API may write fewer entries than the
+	// buffer size, although in practice it fills the entire pre-sized buffer).
+	_paths.resize(pathCount);
+	_modes.resize(modeCount);
+
+	_valid = true;
+	BOOST_LOG(info) << "[SUDOVDA] display_topology_snapshot: captured " << pathCount << " path(s) and " << modeCount << " mode(s).";
+}
+
+display_topology_snapshot_t::~display_topology_snapshot_t() {
+	if (!_valid) {
+		// Capture failed — refuse to call SetDisplayConfig with empty/garbage arrays.
+		return;
+	}
+
+	LONG status = SetDisplayConfig(
+		static_cast<UINT32>(_paths.size()),
+		_paths.data(),
+		static_cast<UINT32>(_modes.size()),
+		_modes.data(),
+		SDC_APPLY
+		| SDC_USE_SUPPLIED_DISPLAY_CONFIG
+		| SDC_ALLOW_PATH_ORDER_CHANGES
+		| SDC_SAVE_TO_DATABASE
+	);
+
+	if (status == ERROR_SUCCESS) {
+		BOOST_LOG(info) << "[SUDOVDA] display_topology_snapshot: pre-stream topology restored.";
+	} else {
+		BOOST_LOG(warning) << "[SUDOVDA] display_topology_snapshot: SetDisplayConfig restore failed (status=" << status << ").";
+	}
+}
+
+std::unique_ptr<display_topology_snapshot_t>& topology_snapshot_slot() {
+	// Function-local static: lifetime extends to process teardown so its destructor
+	// runs even on abnormal exits that go through std::exit / std::terminate /
+	// signal handlers that return into the runtime. proc::execute() resets() this
+	// before each session and proc::terminate() / signal handlers reset() it after
+	// removing the virtual display, which is the normal restore path. The static
+	// destructor is the safety net for crashes / unexpected paths.
+	static std::unique_ptr<display_topology_snapshot_t> slot;
+	return slot;
+}
+// ----------------------------------------------------------------------------
 
 // START ISOLATED DISPLAY DECLARATIONS
 struct positionwidthheight;

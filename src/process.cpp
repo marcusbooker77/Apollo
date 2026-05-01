@@ -246,6 +246,21 @@ namespace proc {
       }
 
       if (vDisplayDriverStatus == VDISPLAY::DRIVER_STATUS::OK) {
+        // Capture the user's pre-stream display topology BEFORE we add a virtual
+        // display or otherwise touch the layout. The RAII slot lives until either
+        // proc::terminate() resets it (normal exit) or static teardown / signal
+        // handler resets it (abnormal exit), at which point the destructor restores
+        // the captured paths+modes via SetDisplayConfig. This is what guarantees
+        // physical displays come back in their original arrangement (extend / clone /
+        // internal-only) instead of getting stuck deactivated.
+        auto& topology_slot = VDISPLAY::topology_snapshot_slot();
+        if (!topology_slot) {
+          topology_slot = std::make_unique<VDISPLAY::display_topology_snapshot_t>();
+          if (!topology_slot->valid()) {
+            BOOST_LOG(warning) << "Display topology capture failed; physical displays may not be auto-restored on exit.";
+          }
+        }
+
         // Try set the render adapter matching the capture adapter if user has specified one
         if (!config::video.adapter_name.empty()) {
           VDISPLAY::setRenderAdapterByName(platf::from_utf8(config::video.adapter_name));
@@ -765,6 +780,13 @@ namespace proc {
       } else {
         BOOST_LOG(warning) << "Virtual Display remove failed, but it seems it was not created correctly either.";
       }
+
+      // Restore the pre-stream display topology now (normal-exit path). Resetting
+      // the unique_ptr triggers display_topology_snapshot_t::~display_topology_snapshot_t,
+      // which calls SetDisplayConfig with the originally-captured path+mode arrays.
+      // If we crash or get a signal before reaching here, the static slot's destructor
+      // will perform the same restore on process teardown.
+      VDISPLAY::topology_snapshot_slot().reset();
     }
 
     // Only show the Stopped notification if we actually have an app to stop
