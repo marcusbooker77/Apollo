@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import Checkbox from '../../Checkbox.vue'
 
 const props = defineProps({
@@ -46,6 +46,16 @@ function addCmd(cmdArr, template, idx) {
 function removeCmd(cmdArr, index) {
   cmdArr.splice(index,1)
 }
+
+// True when pin_required is toggled OFF (any of the falsy representations
+// the Checkbox component supports: "false", "0", "disabled", "disable",
+// "no", "off", boolean false, number 0).
+const pinRequiredOff = computed(() => {
+  const v = config.value.pin_required
+  if (v === false || v === 0) return true
+  const s = `${v}`.toLowerCase().trim()
+  return ['false', '0', 'disabled', 'disable', 'no', 'off'].includes(s)
+})
 
 onMounted(() => {
   // Set default value for enable_pairing if not present
@@ -224,6 +234,10 @@ onMounted(() => {
               v-model="config.pin_required"
               default="true"
     ></Checkbox>
+    <div class="alert alert-danger alert-dismissible fade show mb-3" role="alert" v-if="pinRequiredOff">
+      <strong>&#9888; </strong>{{ $t('config.pin_required_warning') }}
+      <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
+    </div>
 
     <!-- Enable Discovery -->
     <Checkbox class="mb-3"

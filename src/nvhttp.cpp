@@ -8,9 +8,15 @@
 // standard includes
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <format>
+#include <fstream>
+#include <iomanip>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <utility>
 
@@ -742,6 +748,50 @@ namespace nvhttp {
     response->close_connection_after_response = true;
   }
 
+  // Append a single line to the security audit log alongside other Apollo
+  // state files (platf::appdata() — same dir as sunshine.conf / apps.json).
+  // Failures are logged once and swallowed; we never block pairing on this.
+  static void append_audit_log(const std::string &line) {
+    static std::mutex audit_mutex;
+    static std::atomic<bool> warned_open_failure {false};
+
+    std::lock_guard<std::mutex> lk(audit_mutex);
+    try {
+      auto path = platf::appdata() / "audit.log";
+      // std::ios::app uses O_APPEND on POSIX and FILE_APPEND_DATA on Win32,
+      // so concurrent writers (and other Apollo instances) won't tear lines.
+      std::ofstream out(path, std::ios::app | std::ios::out);
+      if (!out.is_open()) {
+        if (!warned_open_failure.exchange(true)) {
+          BOOST_LOG(error) << "Failed to open audit log at " << path.string()
+                           << " — security events will not be persisted";
+        }
+        return;
+      }
+      out << line << '\n';
+    } catch (const std::exception &e) {
+      if (!warned_open_failure.exchange(true)) {
+        BOOST_LOG(error) << "Audit log write failed: " << e.what();
+      }
+    }
+  }
+
+  // ISO 8601 UTC timestamp, e.g. "2026-05-01T17:42:09Z".
+  static std::string iso8601_utc_now() {
+    using namespace std::chrono;
+    auto now = system_clock::now();
+    std::time_t t = system_clock::to_time_t(now);
+    std::tm tm_utc {};
+#ifdef _WIN32
+    gmtime_s(&tm_utc, &t);
+#else
+    gmtime_r(&t, &tm_utc);
+#endif
+    std::ostringstream ss;
+    ss << std::put_time(&tm_utc, "%Y-%m-%dT%H:%M:%SZ");
+    return ss.str();
+  }
+
   template <class T>
   void pair(std::shared_ptr<typename SimpleWeb::ServerBase<T>::Response> response, std::shared_ptr<typename SimpleWeb::ServerBase<T>::Request> request) {
     print_req<T>(request);
@@ -886,6 +936,16 @@ namespace nvhttp {
           }
           BOOST_LOG(warning) << "PIN requirement disabled — auto-accepting pairing for device: "
                              << ptr->second.client.name << " (fixed PIN: 0000)";
+          // Persist a tamper-evident audit record for skip-PIN pair events.
+          // Format: "<ISO8601 UTC> AUTO_PAIR client=<name> ip=<ip> uid=<unique_id>"
+          {
+            std::ostringstream ev;
+            ev << iso8601_utc_now()
+               << " AUTO_PAIR client=" << ptr->second.client.name
+               << " ip=" << client_ip
+               << " uid=" << ptr->second.client.uniqueID;
+            append_audit_log(ev.str());
+          }
           getservercert(ptr->second, tree, "0000");
         } else if (config::sunshine.flags[config::flag::PIN_STDIN]) {
           std::string pin;
